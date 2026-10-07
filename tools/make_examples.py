@@ -50,15 +50,16 @@ def main():
     base.save(EX / "01-clean.png")
     made.append("01-clean.png            clean multicolour, exits 0")
 
-    # a red bird drawn into the sun: sun cell now holds blue, yellow, white,
-    # red and black -- one colour too many
+    # a bird flying past the top of the sun: its cell already holds the sky
+    # (blue, the background) and the sun (yellow); red, black and white make
+    # four colours besides the background - one too many
     img = scene()
     d = ImageDraw.Draw(img)
-    d.rectangle((224, 40, 233, 41), fill=PAL[2])
-    d.rectangle((228, 42, 229, 43), fill=PAL[0])
-    d.rectangle((226, 38, 227, 39), fill=PAL[1])
+    d.rectangle((224, 27, 231, 27), fill=PAL[2])
+    d.rectangle((226, 26, 227, 26), fill=PAL[0])
+    d.rectangle((228, 25, 229, 25), fill=PAL[1])
     img.save(EX / "02-bird-clash.png")
-    made.append("02-bird-clash.png       too many colours in the sun's cells")
+    made.append("02-bird-clash.png       a bird on the sun's edge: one colour too many")
 
     # single-pixel highlights: hires pixels slipped into a multicolour picture
     img = scene()
@@ -91,7 +92,7 @@ def main():
     src = Image.open(EX / "02-bird-clash.png").convert("RGB")
     a = c64lint.analyse(src, "mc")
     ov = c64lint.overlay(a, src)
-    ov.crop((540, 60, 840, 240)).resize((600, 360), Image.NEAREST).save(DOCS / "overlay-example.png")
+    ov.crop((540, 30, 840, 210)).resize((600, 360), Image.NEAREST).save(DOCS / "overlay-example.png")
 
     (EX / "README.txt").write_text(
         "c64lint examples - try:\n\n"
