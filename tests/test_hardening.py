@@ -225,3 +225,48 @@ def test_double_dash_without_then_is_a_filename_separator(tmp_path, run, monkeyp
     monkeypatch.chdir(tmp_path)
     code, _ = run("check", "--mode", "mc", "--", "-pic.png")
     assert code == 0
+
+
+# ---------- second review (2026-10-07, external) --------------------------------
+
+def test_fix_uses_only_cell_colours_plus_background(tmp_path, run):
+    """README guarantee: a fix keeps the cell's own colours, plus the background,
+    which every multicolour cell can show for free (bit pair 00)."""
+    rnd = random.Random(11)
+    for trial in range(8):
+        px = {(x, y): rnd.randrange(16) for x in range(0, 40) for y in range(0, 16)}
+        bg = rnd.randrange(16)
+        p = make_png(tmp_path / "a.png", 160, 200, bg, px)
+        run("check", p, "--mode", "mc", "--bg", str(bg), "--fix", tmp_path / "f.png")
+        before = Image.open(p).convert("RGB").load()
+        after = Image.open(tmp_path / "f.png").convert("RGB").load()
+        for cx in range(10):
+            for cy in range(2):
+                pix = [(cx * 4 + x, cy * 8 + y) for x in range(4) for y in range(8)]
+                had = {before[q] for q in pix} | {PEPTO[bg]}
+                assert {after[q] for q in pix} <= had
+
+
+def test_png2prg_launch_failure_is_exit_2(tmp_path, run, monkeypatch):
+    monkeypatch.setattr(c64lint.shutil, "which", lambda name: "/nope/png2prg")
+
+    def boom(*a, **k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(c64lint.subprocess, "run", boom)
+    p = make_png(tmp_path / "a.png", 160, 200, 6)
+    code, out = run("check", p, "--mode", "mc", "--then", "png2prg")
+    assert code == 2 and "!!" in out and "denied" in out
+
+
+def test_forced_bg_skips_the_ranking(tmp_path, run):
+    p = make_png(tmp_path / "a.png", 320, 200, 6, anchored(mc_cell(3, 2, [1, 2, 3, 4])))
+    code, out = run("check", p, "--mode", "mc", "--bg", "6", "--json", tmp_path / "r.json")
+    rep = json.loads((tmp_path / "r.json").read_text())
+    assert [r["bg"] for r in rep["bg_ranking"]] == [6]
+    assert "ranking skipped" in out
+
+
+def test_no_cache_survives_an_analysis():
+    """Library use must not keep every cell histogram ever seen."""
+    assert not hasattr(c64lint.best_set, "cache_info")

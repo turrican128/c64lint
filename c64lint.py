@@ -17,7 +17,6 @@ import shutil
 import subprocess
 import sys
 import warnings
-from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -210,6 +209,7 @@ def analyse(img, mode, palette=None, bg=None):
     if mode == "mc" and w == 320:
         lw = 160
         logical = []
+        cell_counts = {}           # (cx, cy) -> {colour: pixels}, built on demand
         for y in range(h):
             row = grid[y * w:(y + 1) * w]
             for lx in range(lw):
@@ -218,13 +218,15 @@ def analyse(img, mode, palette=None, bg=None):
                     logical.append(p0)
                     continue
                 a.pairs.append({"x": 2 * lx, "y": y, "colours": sorted((p0, p1))})
-                cx, cy = lx // 4, y // 8
-                n0 = n1 = 0
-                for yy in range(cy * 8, cy * 8 + 8):
-                    for xx in range(cx * 8, cx * 8 + 8):
-                        v = grid[yy * w + xx]
-                        n0 += v == p0
-                        n1 += v == p1
+                key = (lx // 4, y // 8)
+                counts_here = cell_counts.get(key)
+                if counts_here is None:
+                    counts_here = {}
+                    for yy in range(key[1] * 8, key[1] * 8 + 8):
+                        for v in grid[yy * w + key[0] * 8:yy * w + key[0] * 8 + 8]:
+                            counts_here[v] = counts_here.get(v, 0) + 1
+                    cell_counts[key] = counts_here
+                n0, n1 = counts_here.get(p0, 0), counts_here.get(p1, 0)
                 logical.append(p0 if (n0, -p0) > (n1, -p1) else p1)
     else:
         lw = w
@@ -247,15 +249,25 @@ def analyse(img, mode, palette=None, bg=None):
     a.hists = hists
 
     de = palette_de(pal)
+    memo = {}
+
+    def cell_fix(hist, b):
+        key = (hist, b)
+        if key not in memo:
+            memo[key] = best_set(hist, b, de)
+        return memo[key]
+
     if mode == "mc":
         totals = [0] * 16
         for v in logical:
             totals[v] += 1
         ranking = []
-        for b in range(16):
+        # a forced background is the user's decision: costing the other 15
+        # is most of the run time on busy pictures, so it is skipped
+        for b in (range(16) if bg is None else (bg,)):
             cost = bad = 0
             for hist in hists:
-                c, _ = best_set(hist, b, de)
+                c, _ = cell_fix(hist, b)
                 if c is not None:
                     cost += c
                     bad += 1
@@ -272,7 +284,7 @@ def analyse(img, mode, palette=None, bg=None):
 
     a.cells = []
     for i, hist in enumerate(hists):
-        cost, keep = best_set(hist, a.bg, de)
+        cost, keep = cell_fix(hist, a.bg)
         if cost is None:
             continue
         cols = dict(hist)
@@ -294,7 +306,6 @@ def palette_de(pal):
     return tuple(tuple(delta_e(p, q) for q in plab) for p in plab)
 
 
-@lru_cache(maxsize=None)
 def best_set(hist, bg, de):
     """Cheapest legal colour set for one cell, by exhaustive search.
 
@@ -530,10 +541,11 @@ def print_report(a, path, palette_forced, bg_forced, notes=()):
               f"pixels are 2 wide), first at ({p['x']},{p['y']}): "
               f"{_name(p['colours'][0])} / {_name(p['colours'][1])}")
     if a.mode == "mc":
-        top = ", ".join(f"{_name(r['bg'])} ({r['bad_cells']} bad, cost {r['cost']})"
-                        for r in a.bg_ranking[:5])
-        print(f"[*] background ranking: {top}")
-        src = "forced with --bg" if bg_forced else "best"
+        if not bg_forced:
+            top = ", ".join(f"{_name(r['bg'])} ({r['bad_cells']} bad, cost {r['cost']})"
+                            for r in a.bg_ranking[:5])
+            print(f"[*] background ranking: {top}")
+        src = "forced with --bg; ranking skipped" if bg_forced else "best"
         print(f"[*] background: {_name(a.bg)} ({src})")
     for c in a.cells:
         cols = ", ".join(f"{_name(int(k))} x{n}" for k, n in c["colours"].items())
@@ -716,7 +728,11 @@ def check(args, then_args):
         else:
             cmd = [exe, *then_args, str(clean_png)]
             print(f"[*] running {' '.join(cmd)}")
-            if subprocess.run(cmd).returncode != 0:
+            try:
+                result = subprocess.run(cmd)
+            except OSError as e:
+                raise LintError(f"could not start png2prg ({exe}): {e}") from None
+            if result.returncode != 0:
                 raise LintError("png2prg failed (see its output above)")
     return 0 if a.clean else 1
 

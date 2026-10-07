@@ -75,8 +75,11 @@ Applied in order, on the working copy:
 
 Guarantees: clean cells are untouched; no dithering; the same input and
 options give byte-identical output. The search is always exhaustive (QA
-found a swap-search shortcut up to dE 85 off in noisy cells); only colours
-already in the cell are candidates.
+found a swap-search shortcut up to dE 85 off in noisy cells); candidates
+are the cell's own colours plus, in multicolour, the background (second
+review, 2026-10-07: the README had wrongly promised no new colours).
+A forced --bg skips costing the other 15 backgrounds (33 s -> 1.5 s on
+noise). The cell-fix memo lives for one analysis, never process-wide.
 
 Output safety (added after QA): every output path, including the derived
 `.diff.png`, is checked before anything is written. Same file as the input

@@ -87,8 +87,9 @@ not yellow. Each removed pixel goes to its nearest kept colour.
 - Cells that were already fine are never touched.
 - No dithering is added.
 - Same input, same options: byte-identical output.
-- Only colours already in the cell are kept; the fix never introduces a new
-  colour into a cell.
+- A fix only uses colours already in the cell, plus the background colour,
+  which every multicolour cell can show anyway (bit pair 00). Repainting a
+  stray pixel to the background is often the cheapest fix.
 
 Pixel counts in the report are C64 pixels (one multicolour pixel = two screen
 pixels).
@@ -99,7 +100,7 @@ pixels).
 |---|---|
 | `--mode mc` / `--mode hires` | Required. Multicolour takes 160x200 or 320x200, hires 320x200 |
 | `--palette NAME` | Use this palette instead of detecting one |
-| `--bg N` | Background colour 0-15 (multicolour only) |
+| `--bg N` | Background colour 0-15 (multicolour only). Skips costing the other 15, which is much faster on busy pictures |
 | `--overlay OUT.png` | Problems drawn over your picture, 5x size |
 | `--json OUT.json` | Everything in the report, machine-readable |
 | `--fix OUT.png` | Cheapest fix, plus `OUT.diff.png`: before and after side by side |
