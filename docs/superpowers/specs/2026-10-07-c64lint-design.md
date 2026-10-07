@@ -74,7 +74,19 @@ Applied in order, on the working copy:
    lower index).
 
 Guarantees: clean cells are untouched; no dithering; the same input and
-options give byte-identical output.
+options give byte-identical output. The search is always exhaustive (QA
+found a swap-search shortcut up to dE 85 off in noisy cells); only colours
+already in the cell are candidates.
+
+Output safety (added after QA): every output path, including the derived
+`.diff.png`, is checked before anything is written. Same file as the input
+(compared by resolved path and by `os.path.samefile`, which covers case,
+UNC, long-path and hardlinks), two outputs on one file, a non-.png picture
+output, a directory or a missing folder: exit 2, nothing written.
+
+Input limits (added after QA): size checked before decoding; >256 distinct
+colours refused as a photo; 16-bit greyscale scaled, not clipped; animated
+PNG checked on frame 1 with a warning.
 
 ## Command line
 
@@ -87,9 +99,10 @@ c64lint palettes        # list built-in palettes
 
 - Console: `[*]` progress/info, `[!]` warnings, `!!` errors; final summary
   line.
-- `--overlay`: input scaled ×3 (nearest), broken cells boxed red, surplus
-  pixels highlighted, everything else dimmed. With `--fix`, a second image
-  `<fix>.diff.png` marks every changed pixel.
+- `--overlay`: input scaled x5 (nearest), broken cells framed red outside
+  the cell, surplus pixels marked with a magenta corner square, everything
+  else dimmed. `--fix` always also writes `<fix>.diff.png`: before and after
+  side by side, changed pixels lit.
 - `--json`: schema `{"version":1, "file", "mode", "palette", "bg",
   "bg_ranking":[{"bg","cost","bad_cells"}], "off_palette":[...],
   "pairs":[...], "cells":[{"cx","cy","colours":{idx:count},

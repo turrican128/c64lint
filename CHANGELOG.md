@@ -10,3 +10,4 @@ First version.
 - Ranks all 16 background colours by fix cost.
 - Explains each broken cell: its colours, the surplus one, the cheapest fix.
 - `--fix`, `--overlay`, `--json`, `--kla`, `--then png2prg`.
+- No output can overwrite the input picture, by any spelling of its path.

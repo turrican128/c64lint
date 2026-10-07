@@ -20,20 +20,20 @@ It is a checker, not a converter. When the picture is clean it hands it to
 
 ![overlay](docs/overlay-example.png)
 
-*Overlay of `examples/02-bird-clash.png`: broken cells boxed red, the surplus
-pixels ringed magenta, everything that is fine dimmed.*
+*Overlay of `examples/02-bird-clash.png`: the broken cell framed red, the
+surplus pixel marked magenta, everything that is fine dimmed.*
 
 ## Quick start
 
 ```
-c64lint check pic.png --mode mc
+c64lint check examples/02-bird-clash.png --mode mc
 ```
 
 ```
-[*] pic.png: 320x200 multicolour, palette pepto-pal (detected)
-[*] background ranking: 6 blue (2 bad, cost 511.19), 8 orange (5 bad, cost 1080.17), ...
+[*] examples/02-bird-clash.png: 320x200 multicolour, palette pepto-pal (detected)
+[*] background ranking: 6 blue (1 bad, cost 39.43), 7 yellow (1 bad, cost 39.43), 1 white (1 bad, cost 39.43), 2 red (1 bad, cost 39.43), 0 black (1 bad, cost 51.33)
 [*] background: 6 blue (best)
-[!] cell (10,5) at x=80 y=40: 0 black x7, 1 white x7, 7 yellow x6, 14 light blue x6, 15 light grey x6; surplus: 14 light blue, 15 light grey; fix repaints 12 C64 pixel(s)
+[!] cell (28,3) at x=224 y=24: 6 blue x18, 7 yellow x8, 2 red x4, 0 black x1, 1 white x1; surplus: 0 black; fix repaints 1 C64 pixel(s)
 [!] NOT CLEAN: 1 broken cell(s)
 ```
 
@@ -44,7 +44,13 @@ c64lint check pic.png --mode mc --overlay problems.png --fix fixed.png
 ```
 
 `fixed.png` is your picture with the cheapest fix applied; `fixed.diff.png`
-lights up exactly the pixels that changed. Your own file is never written to.
+shows before and after side by side, with only the changed pixels lit.
+
+**Your picture is never written to.** Every output path is checked before
+anything is written: one that names your input - by any spelling, a
+different case, a UNC or `\\?\` path, a hardlink - is refused, as are two
+outputs on the same file or a folder that does not exist. A refused run
+writes nothing.
 
 Then build it:
 
@@ -81,9 +87,8 @@ not yellow. Each removed pixel goes to its nearest kept colour.
 - Cells that were already fine are never touched.
 - No dithering is added.
 - Same input, same options: byte-identical output.
-- A cell with more than 10 candidate colours (photo-like noise, not pixel art)
-  is solved by a fast swap search instead of trying every set; the report
-  marks it *approximate*.
+- Only colours already in the cell are kept; the fix never introduces a new
+  colour into a cell.
 
 Pixel counts in the report are C64 pixels (one multicolour pixel = two screen
 pixels).
@@ -95,9 +100,9 @@ pixels).
 | `--mode mc` / `--mode hires` | Required. Multicolour takes 160x200 or 320x200, hires 320x200 |
 | `--palette NAME` | Use this palette instead of detecting one |
 | `--bg N` | Background colour 0-15 (multicolour only) |
-| `--overlay OUT.png` | Problems drawn over your picture, 3x size |
+| `--overlay OUT.png` | Problems drawn over your picture, 5x size |
 | `--json OUT.json` | Everything in the report, machine-readable |
-| `--fix OUT.png` | Cheapest fix, plus `OUT.diff.png` showing the changes |
+| `--fix OUT.png` | Cheapest fix, plus `OUT.diff.png`: before and after side by side |
 | `--kla OUT.kla` | Koala file (multicolour). Written only from a clean result |
 | `--then png2prg -- ARGS` | Run png2prg with ARGS on the clean result |
 
@@ -110,8 +115,12 @@ bad input or bad options. Use it in a makefile in front of png2prg.
 
 ## Input
 
-PNG only: RGB, RGBA, greyscale or indexed. Transparent pixels are refused -
-the C64 has no transparency, so flatten onto your background first.
+PNG only: RGB, RGBA, greyscale (8 or 16 bit) or indexed. Transparent pixels
+are refused - the C64 has no transparency, so flatten onto your background
+first. A picture with more than 256 different colours is refused too: that
+is a photo or a scaled image, so convert it to C64 colours first (Dithertron,
+Retropixels) and check the result. An animated PNG is checked on its first
+frame, with a warning.
 
 ## Examples
 

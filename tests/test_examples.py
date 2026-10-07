@@ -34,3 +34,12 @@ def test_every_example_is_listed():
     listed = (EX / "README.txt").read_text()
     for p in EX.glob("*.png"):
         assert p.name in listed
+
+
+def test_readme_quick_start_output_is_real(run):
+    """The sample output in README.md must be what the tool prints today."""
+    readme = (EX.parent / "README.md").read_text(encoding="utf-8")
+    block = readme.split("c64lint check examples/02-bird-clash.png --mode mc\n```\n\n```\n")[1]
+    block = block.split("\n```")[0]
+    _, out = run("check", "examples/02-bird-clash.png", "--mode", "mc")
+    assert out.replace("\\", "/").rstrip("\n") == block

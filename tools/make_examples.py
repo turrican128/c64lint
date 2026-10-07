@@ -92,7 +92,7 @@ def main():
     src = Image.open(EX / "02-bird-clash.png").convert("RGB")
     a = c64lint.analyse(src, "mc")
     ov = c64lint.overlay(a, src)
-    ov.crop((540, 30, 840, 210)).resize((600, 360), Image.NEAREST).save(DOCS / "overlay-example.png")
+    ov.crop((900, 50, 1400, 350)).resize((600, 360), Image.NEAREST).save(DOCS / "overlay-example.png")
 
     (EX / "README.txt").write_text(
         "c64lint examples - try:\n\n"

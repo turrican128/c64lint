@@ -127,7 +127,7 @@ def test_worst_case_noise_is_fast(tmp_path, run):
     elapsed = time.perf_counter() - t
     assert code == 1
     assert run("check", tmp_path / "f.png", "--mode", "mc")[0] == 0
-    assert elapsed < 20, elapsed  # pure noise; real photos take < 0.5 s
+    assert elapsed < 60, elapsed  # pure noise, 16 colours per cell (~17 s); real art < 0.5 s
 
 
 # ---------- outputs ----------------------------------------------------------
@@ -136,7 +136,7 @@ def test_overlay_written(tmp_path, run):
     p = make_png(tmp_path / "a.png", 320, 200, 6, anchored(mc_cell(3, 2, [1, 2, 3, 4])))
     run("check", p, "--mode", "mc", "--overlay", tmp_path / "o.png")
     img = Image.open(tmp_path / "o.png")
-    assert img.size == (960, 600)
+    assert img.size == (1600, 1000)   # x5
 
 
 def test_kla_round_trip(tmp_path, run):

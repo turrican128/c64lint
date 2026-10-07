@@ -12,9 +12,11 @@ import argparse
 import itertools
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
+import warnings
 from functools import lru_cache
 from pathlib import Path
 
@@ -55,6 +57,8 @@ PALETTES = {
 }
 
 FAR_DELTA_E = 20.0   # beyond this from every palette entry: probably not C64 art
+MAX_COLOURS = 256    # more distinct colours than this: a photo, not pixel art
+SIZES = ((160, 200), (320, 200))
 
 
 class LintError(Exception):
@@ -87,18 +91,37 @@ def delta_e(a, b):
 # ---------- input -------------------------------------------------------------
 
 def load_png(path):
-    """Return an RGB PIL image, or raise LintError with a readable reason."""
+    """Return (RGB image, notes), or raise LintError with a readable reason.
+
+    notes are warnings for the report (e.g. an animated PNG)."""
     path = Path(path)
+    if path.is_dir():
+        raise LintError(f"{path}: is a directory, not a picture")
     if not path.is_file():
         raise LintError(f"{path}: file not found")
+    notes = []
     try:
-        img = Image.open(path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            img = Image.open(path)
         fmt = img.format
-        img.load()
     except Exception as e:  # Pillow raises many types for broken files
         raise LintError(f"{path}: not a readable PNG ({e})") from None
     if fmt != "PNG":
         raise LintError(f"{path}: is {fmt or 'not an image'}, c64lint reads PNG only")
+    if img.size not in SIZES:          # checked before decoding a huge file
+        w, h = img.size
+        raise LintError(f"{path}: picture is {w}x{h}; C64 bitmaps are 320x200 "
+                        "(multicolour also 160x200)")
+    if getattr(img, "n_frames", 1) > 1:
+        notes.append(f"animated PNG with {img.n_frames} frames: only the first frame "
+                     "is checked")
+    try:
+        img.load()
+    except Exception as e:
+        raise LintError(f"{path}: not a readable PNG ({e})") from None
+    if img.mode.startswith("I"):        # 16-bit greyscale: scale, don't clip
+        img = img.convert("I").point(lambda v: v * (1 / 257)).convert("L")
     if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
         rgba = img.convert("RGBA")
         alpha = rgba.getchannel("A")
@@ -108,7 +131,7 @@ def load_png(path):
             raise LintError(f"{path}: {n} transparent pixel(s); C64 pictures have no "
                             "transparency - flatten onto the background colour first")
         img = rgba
-    return img.convert("RGB")
+    return img.convert("RGB"), notes
 
 
 # ---------- analysis ----------------------------------------------------------
@@ -154,6 +177,11 @@ def analyse(img, mode, palette=None, bg=None):
         if c not in first:
             first[c] = (i % w, i // w)
         counts[c] = counts.get(c, 0) + 1
+    if len(first) > MAX_COLOURS:
+        raise LintError(f"picture has {len(first)} different colours; a C64 picture has "
+                        "16. This looks like a photo or a scaled image - c64lint checks "
+                        "pixel art. Convert it to C64 colours first (e.g. Dithertron, "
+                        "Retropixels), then check the result")
     a.palette = detect_palette(list(first), palette)
     pal = PALETTES[a.palette]
     a.rgb = pal
@@ -218,7 +246,7 @@ def analyse(img, mode, palette=None, bg=None):
             hists.append(tuple(sorted(hist.items())))
     a.hists = hists
 
-    de = tuple(tuple(r) for r in a.de)
+    de = palette_de(pal)
     if mode == "mc":
         totals = [0] * 16
         for v in logical:
@@ -227,7 +255,7 @@ def analyse(img, mode, palette=None, bg=None):
         for b in range(16):
             cost = bad = 0
             for hist in hists:
-                c, _, _ = _best_set(hist, b, de)
+                c, _ = best_set(hist, b, de)
                 if c is not None:
                     cost += c
                     bad += 1
@@ -244,44 +272,46 @@ def analyse(img, mode, palette=None, bg=None):
 
     a.cells = []
     for i, hist in enumerate(hists):
-        cost, keep, approx = _best_set(hist, a.bg, de)
+        cost, keep = best_set(hist, a.bg, de)
         if cost is None:
             continue
         cols = dict(hist)
         changed = sum(n for c, n in hist if c not in keep)
         a.cells.append({
             "cx": i % 40, "cy": i // 40,
-            "x": (i % 40) * 8, "y": (i // 40) * 8,
+            "x": (i % 40) * cw * (w // lw), "y": (i // 40) * 8,
             "colours": {str(c): n for c, n in sorted(cols.items(), key=lambda t: (-t[1], t[0]))},
             "surplus": sorted(c for c in cols if c not in keep),
-            "fix": {"keep": list(keep), "changed": changed, "cost": round(cost, 2),
-                    "approximate": approx},
+            "fix": {"keep": list(keep), "changed": changed, "cost": round(cost, 2)},
         })
     a.clean = not (a.off_palette or a.pairs or a.cells)
     return a
 
 
-EXACT_LIMIT = 120   # colour sets per cell searched exhaustively (C(10,3))
+def palette_de(pal):
+    """16x16 table of CIE76 distances between a palette's colours."""
+    plab = [rgb_to_lab(p) for p in pal]
+    return tuple(tuple(delta_e(p, q) for q in plab) for p in plab)
 
 
 @lru_cache(maxsize=None)
-def _best_set(hist, bg, de):
-    """Cheapest legal colour set for one cell.
+def best_set(hist, bg, de):
+    """Cheapest legal colour set for one cell, by exhaustive search.
 
-    Returns (None, None, False) when the cell is already legal, else
-    (cost, keep, approximate): keep is the sorted tuple of colours the cell
-    may keep (for multicolour it includes the background). Cells with more
-    candidate colours than EXACT_LIMIT allows - only photo-like noise gets
-    there - use a deterministic swap search instead of trying every set."""
+    hist is the cell's sorted ((colour, count), ...); bg is the background
+    (None for hires). Returns (None, None) when the cell is already legal,
+    else (cost, keep): keep is the sorted tuple of colours the cell may keep
+    (for multicolour it includes the background). Only the cell's own colours
+    are candidates. Ties go to the smallest keep tuple."""
     colours = [c for c, _ in hist]
     if bg is None:                        # hires: two colours per cell
         if len(colours) <= 2:
-            return None, None, False
+            return None, None
         pool, k, fixed = colours, 2, ()
     else:                                 # multicolour: background + three
         pool = [c for c in colours if c != bg]
         if len(pool) <= 3:
-            return None, None, False
+            return None, None
         k, fixed = 3, (bg,)
     # biggest contributions first, so the running total passes the bound early
     rows = [(c, n, de[c]) for c, n in sorted(hist, key=lambda t: -t[1])]
@@ -304,36 +334,18 @@ def _best_set(hist, bg, de):
                         return None
         return cost
 
-    def better(cost, keep, best):  # lower cost, then smaller tuple
-        return best is None or cost < best[0] - 1e-9 or (
-            abs(cost - best[0]) <= 1e-9 and keep < best[1])
-
-    if math.comb(len(pool), k) <= EXACT_LIMIT:
-        best = None
-        for subset in itertools.combinations(pool, k):
-            keep = tuple(sorted(subset + fixed))
-            cost = cost_of(keep, math.inf if best is None else best[0])
-            if cost is not None and better(cost, keep, best):
-                best = (cost, keep)
-        return best[0], best[1], False
-
+    # seed the bound with the most-used colours: usually close to the answer,
+    # so most other sets are abandoned after a pixel or two
     count = dict(hist)
-    current = sorted(pool, key=lambda c: (-count[c], c))[:k]
-    keep = tuple(sorted(current + list(fixed)))
-    best = (cost_of(keep, math.inf), keep)
-    improved = True
-    while improved:
-        improved = False
-        for i in range(k):
-            for c in pool:
-                if c in current:
-                    continue
-                trial = current[:i] + [c] + current[i + 1:]
-                keep = tuple(sorted(trial + list(fixed)))
-                cost = cost_of(keep, best[0])
-                if cost is not None and better(cost, keep, best):
-                    best, current, improved = (cost, keep), trial, True
-    return best[0], best[1], True
+    seed = tuple(sorted(sorted(pool, key=lambda c: (-count[c], c))[:k] + list(fixed)))
+    best = (cost_of(seed, math.inf), seed)
+    for subset in itertools.combinations(pool, k):
+        keep = tuple(sorted(subset + fixed))
+        cost = cost_of(keep, best[0])
+        if cost is not None and (cost < best[0] - 1e-9 or (
+                abs(cost - best[0]) <= 1e-9 and keep < best[1])):
+            best = (cost, keep)
+    return best
 
 
 # ---------- fixing ------------------------------------------------------------
@@ -406,16 +418,32 @@ def decode_koala(data, palette):
 
 # ---------- pictures for humans ------------------------------------------------
 
-SCALE = 3
+SCALE = 5
+MARK = 2   # size of the corner marks on a scaled pixel
 
 
 def _dim(img, factor=0.35):
     return Image.eval(img, lambda v: int(v * factor))
 
 
+def _mark(draw, x, y, colour, corner):
+    """Small square in one corner of scaled input pixel (x, y); the rest of
+    the pixel keeps its own colour, so the mark never hides what it marks."""
+    px, py = x * SCALE, y * SCALE
+    if corner == "br":
+        px, py = px + SCALE - MARK, py + SCALE - MARK
+    draw.rectangle((px, py, px + MARK - 1, py + MARK - 1), fill=colour)
+
+
+def _box(draw, x0, y0, x1, y1, colour):
+    """Frame drawn just OUTSIDE input pixels x0..x1-1, y0..y1-1."""
+    draw.rectangle((x0 * SCALE - 1, y0 * SCALE - 1, x1 * SCALE, y1 * SCALE), outline=colour)
+
+
 def overlay(a, src):
-    """Input scaled x3: clean areas dimmed, broken cells boxed red, surplus
-    pixels ringed magenta, off-palette pixels ringed cyan, bad pairs yellow."""
+    """Input scaled x5: clean areas dimmed; broken cells at full brightness,
+    framed red, surplus pixels marked magenta (top-left corner); off-palette
+    pixels marked cyan (bottom-right); split pairs framed yellow."""
     w, h = a.size
     big = src.resize((w * SCALE, h * SCALE), Image.NEAREST)
     out = _dim(big)
@@ -425,41 +453,51 @@ def overlay(a, src):
         x0, y0 = cell["cx"] * a.cell_w * sx, cell["cy"] * 8
         box = (x0 * SCALE, y0 * SCALE, (x0 + a.cell_w * sx) * SCALE, (y0 + 8) * SCALE)
         out.paste(big.crop(box), box[:2])
+    for cell in a.cells:
+        x0, y0 = cell["cx"] * a.cell_w * sx, cell["cy"] * 8
         keep = cell["fix"]["keep"]
         for y in range(y0, y0 + 8):
             for lx in range(a.cell_w):
                 if a.logical[y * a.lw + cell["cx"] * a.cell_w + lx] not in keep:
-                    x = (cell["cx"] * a.cell_w + lx) * sx
-                    draw.rectangle((x * SCALE, y * SCALE, (x + sx) * SCALE - 1,
-                                    (y + 1) * SCALE - 1), outline=(255, 0, 255))
-        draw.rectangle((box[0], box[1], box[2] - 1, box[3] - 1), outline=(255, 0, 0))
+                    for dx in range(sx):
+                        _mark(draw, (cell["cx"] * a.cell_w + lx) * sx + dx, y,
+                              (255, 0, 255), "tl")
+        _box(draw, x0, y0, x0 + a.cell_w * sx, y0 + 8, (255, 0, 0))
     px = src.load()
     off = {o["rgb"] for o in a.off_palette}
     if off:
         for y in range(h):
             for x in range(w):
                 if "#%02X%02X%02X" % px[x, y] in off:
-                    draw.rectangle((x * SCALE, y * SCALE, x * SCALE + SCALE - 1,
-                                    y * SCALE + SCALE - 1), outline=(0, 255, 255))
+                    _mark(draw, x, y, (0, 255, 255), "br")
     for p in a.pairs:
-        draw.rectangle((p["x"] * SCALE, p["y"] * SCALE, (p["x"] + 2) * SCALE - 1,
-                        (p["y"] + 1) * SCALE - 1), outline=(255, 255, 0))
+        _box(draw, p["x"], p["y"], p["x"] + 2, p["y"] + 1, (255, 255, 0))
     return out
 
 
 def diff_image(before, after):
-    """Fixed picture scaled x3, unchanged pixels dimmed, changed ones bright."""
+    """Before and after side by side, scaled x5. Pixels the fix changed are
+    at full brightness on both sides (old colour left, new colour right) with
+    a white corner mark; everything unchanged is dimmed."""
     w, h = after.size
-    big = after.resize((w * SCALE, h * SCALE), Image.NEAREST)
-    out = _dim(big)
+    gap = 4 * SCALE
+    out = Image.new("RGB", (2 * w * SCALE + gap, h * SCALE), (40, 40, 40))
+    sides = []
+    for i, img in enumerate((before, after)):
+        big = img.resize((w * SCALE, h * SCALE), Image.NEAREST)
+        left = i * (w * SCALE + gap)
+        out.paste(_dim(big), (left, 0))
+        sides.append((big, left))
     draw = ImageDraw.Draw(out)
     b, f = before.load(), after.load()
     for y in range(h):
         for x in range(w):
             if b[x, y] != f[x, y]:
-                box = (x * SCALE, y * SCALE, x * SCALE + SCALE - 1, y * SCALE + SCALE - 1)
-                out.paste(f[x, y], box[:2] + (box[2] + 1, box[3] + 1))
-                draw.rectangle(box, outline=(255, 255, 255))
+                for big, left in sides:
+                    box = (x * SCALE, y * SCALE, (x + 1) * SCALE, (y + 1) * SCALE)
+                    out.paste(big.crop(box), (left + box[0], box[1]))
+                    draw.rectangle((left + box[0], box[1], left + box[0] + MARK - 1,
+                                    box[1] + MARK - 1), fill=(255, 255, 255))
     return out
 
 
@@ -469,15 +507,23 @@ def _name(i):
     return f"{i} {COLOUR_NAMES[i]}"
 
 
-def print_report(a, path, palette_forced, bg_forced):
+OFF_PALETTE_LINES = 10
+
+
+def print_report(a, path, palette_forced, bg_forced, notes=()):
     mode = "multicolour" if a.mode == "mc" else "hires"
     w, h = a.size
     how = "forced" if palette_forced else "detected"
     print(f"[*] {path}: {w}x{h} {mode}, palette {a.palette} ({how})")
-    for o in a.off_palette:
+    for n in notes:
+        print(f"[!] {n}")
+    for o in a.off_palette[:OFF_PALETTE_LINES]:
         far = " - far from every C64 colour, is this C64 art?" if o["far"] else ""
         print(f"[!] off-palette {o['rgb']} x{o['count']} first at ({o['first'][0]},{o['first'][1]}):"
               f" nearest {_name(o['nearest'])}, dE {o['delta_e']}{far}")
+    if len(a.off_palette) > OFF_PALETTE_LINES:
+        print(f"[!] ... and {len(a.off_palette) - OFF_PALETTE_LINES} more off-palette "
+              "colour(s); --json lists them all")
     if a.pairs:
         p = a.pairs[0]
         print(f"[!] {len(a.pairs)} pixel pair(s) with two different colours (multicolour "
@@ -493,9 +539,7 @@ def print_report(a, path, palette_forced, bg_forced):
         cols = ", ".join(f"{_name(int(k))} x{n}" for k, n in c["colours"].items())
         sur = ", ".join(_name(s) for s in c["surplus"])
         print(f"[!] cell ({c['cx']},{c['cy']}) at x={c['x']} y={c['y']}: {cols}; "
-              f"surplus: {sur}; fix repaints {c['fix']['changed']} C64 pixel(s)"
-              + (" (approximate: too many colours to try every set)"
-                 if c["fix"]["approximate"] else ""))
+              f"surplus: {sur}; fix repaints {c['fix']['changed']} C64 pixel(s)")
     if a.clean:
         print("[*] CLEAN: fits the mode as drawn")
     else:
@@ -543,9 +587,14 @@ def build_parser():
 
 
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        try:   # a Hebrew or accented path must not crash a redirected console
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     argv = list(sys.argv[1:] if argv is None else argv)
     then_args = []
-    if "--" in argv:
+    if "--then" in argv and "--" in argv:
         i = argv.index("--")
         argv, then_args = argv[:i], argv[i + 1:]
     try:
@@ -563,6 +612,56 @@ def main(argv=None):
         return 2
 
 
+def _same_file(p, q):
+    """True if p and q name the same file however they are spelled: case,
+    relative or absolute, long-path or UNC prefixes, hardlinks."""
+    try:
+        if os.path.normcase(str(p.resolve())) == os.path.normcase(str(q.resolve())):
+            return True
+    except OSError:
+        pass
+    try:
+        return p.exists() and q.exists() and os.path.samefile(p, q)
+    except OSError:
+        return False
+
+
+def plan_outputs(args, src_path):
+    """Every file this run will write, checked before anything is written.
+
+    Refuses (LintError, exit 2) an output that is the input picture, two
+    outputs on one file, a picture output that is not .png, a directory, or
+    a folder that does not exist - so a refused run writes nothing at all."""
+    outs = []
+    for flag, value in (("--json", args.json), ("--overlay", args.overlay),
+                        ("--fix", args.fix), ("--kla", args.kla)):
+        if value:
+            outs.append((flag, Path(value)))
+    if args.fix:
+        outs.append(("--fix (its .diff.png)", Path(args.fix).with_suffix(".diff.png")))
+    for flag, path in outs:
+        if flag in ("--fix", "--overlay") and path.suffix.lower() != ".png":
+            raise LintError(f"{flag} {path}: must be a .png file")
+        if path.is_dir():
+            raise LintError(f"{flag} {path}: is a directory")
+        if not path.resolve().parent.is_dir():
+            raise LintError(f"{flag} {path}: folder {path.resolve().parent} does not exist")
+        if _same_file(path, src_path):
+            raise LintError(f"{flag} {path}: that is the input picture - c64lint never "
+                            "writes over your picture; choose another name")
+    for (f1, p1), (f2, p2) in itertools.combinations(outs, 2):
+        if _same_file(p1, p2):
+            raise LintError(f"{f1} and {f2} both write {p2}; give them different names")
+    return dict(outs)
+
+
+def _write(path, writer):
+    try:
+        writer(path)
+    except (OSError, ValueError) as e:
+        raise LintError(f"could not write {path}: {e}") from None
+
+
 def check(args, then_args):
     if then_args and not args.then:
         raise LintError("arguments after -- are only used with --then png2prg")
@@ -570,21 +669,20 @@ def check(args, then_args):
         raise LintError("--kla writes Koala, which is multicolour; hires output: "
                         "use --then png2prg")
     src_path = Path(args.png)
-    if args.fix and Path(args.fix).resolve() == src_path.resolve():
-        raise LintError("--fix must write a new file, not the input picture")
-    img = load_png(src_path)
+    outs = plan_outputs(args, src_path)
+    img, notes = load_png(src_path)
     if args.bg is not None and args.mode == "hires":
-        print("[!] --bg ignored: hires has no shared background colour")
+        notes.append("--bg ignored: hires has no shared background colour")
         args.bg = None
     a = analyse(img, args.mode, args.palette, args.bg)
-    print_report(a, src_path, args.palette is not None, args.bg is not None)
+    print_report(a, src_path, args.palette is not None, args.bg is not None, notes)
 
     if args.json:
-        Path(args.json).write_text(json.dumps(report_json(a, src_path), indent=1) + "\n",
-                                   encoding="utf-8")
+        text = json.dumps(report_json(a, src_path), indent=1) + "\n"
+        _write(outs["--json"], lambda p: p.write_text(text, encoding="utf-8"))
         print(f"[*] wrote {args.json}")
     if args.overlay:
-        overlay(a, img).save(args.overlay)
+        _write(outs["--overlay"], overlay(a, img).save)
         print(f"[*] wrote {args.overlay}")
 
     clean_png = src_path if a.clean else None
@@ -592,9 +690,9 @@ def check(args, then_args):
     if args.fix:
         fl = fixed_logical(a)
         fixed = render(a, fl)
-        fixed.save(args.fix)
-        diff_path = Path(args.fix).with_suffix(".diff.png")
-        diff_image(img, fixed).save(diff_path)
+        _write(outs["--fix"], fixed.save)
+        diff_path = outs["--fix (its .diff.png)"]
+        _write(diff_path, diff_image(img, fixed).save)
         print(f"[*] wrote {args.fix} and {diff_path}")
         clean_png = clean_png or Path(args.fix)
         clean_logical = clean_logical or fl
@@ -604,7 +702,8 @@ def check(args, then_args):
             print("[!] --kla not written: the picture is not clean; add --fix to "
                   "write the fixed picture as Koala")
         else:
-            Path(args.kla).write_bytes(encode_koala(a, clean_logical, a.bg))
+            data = encode_koala(a, clean_logical, a.bg)
+            _write(outs["--kla"], lambda p: p.write_bytes(data))
             print(f"[*] wrote {args.kla}")
 
     if args.then:
