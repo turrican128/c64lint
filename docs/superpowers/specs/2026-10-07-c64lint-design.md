@@ -43,7 +43,11 @@ output (use `--then png2prg`), dithering.
    x+1) whose two pixels differ (after palette snapping) is a finding.
 3. **Background ($d021)** (`mc` only). For each of the 16 colours, cost =
    sum of minimal fix costs over all cells with that background. Ranked
-   ascending (ties → palette index). Best wins unless `--bg N` is given. The
+   by cost, then fewer bad cells, then more pixels of that colour in the
+   picture, then palette index. (A lone broken cell can usually be made
+   legal by picking one of its own colours as background; the pixel-count
+   tie-break keeps a blue picture from reporting "background: black" when
+   several backgrounds cost nothing.) Best wins unless `--bg N` is given. The
    report shows the top 5. `--bg` in hires mode → warning, ignored.
 4. **Cells.** `mc`: 4×8 logical pixels, at most background + 3 colours.
    `hires`: 8×8 pixels, at most 2 colours. A cell over the limit is a finding
