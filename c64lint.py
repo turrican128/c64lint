@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""c64lint - check a PNG against C64 bitmap mode rules and explain the clashes.
+
+Tells you which 8x8 / 4x8 cells break the multicolour or hires colour limits,
+which colour in each cell is the surplus one, which background ($d021) fits the
+picture best, and which palette the picture was drawn in. Optionally writes the
+cheapest fix, an overlay, a JSON report, a Koala file, or hands the clean
+picture to png2prg (github.com/staD020/png2prg).
+"""
+
+import argparse
+import itertools
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import warnings
+from pathlib import Path
+
+from PIL import Image, ImageDraw
+
+VERSION = "0.1.0"
+PNG2PRG_URL = "https://github.com/staD020/png2prg"
+
+COLOUR_NAMES = [
+    "black", "white", "red", "cyan", "purple", "green", "blue", "yellow",
+    "orange", "brown", "light red", "dark grey", "grey", "light green",
+    "light blue", "light grey",
+]
+
+# Palette values copied from the .vpl files shipped with VICE 3.0, plus
+# Colodore. Order matters: on a detection tie the earlier palette wins.
+_PALETTE_HEX = {
+    "pepto-pal": "000000 FFFFFF 68372B 70A4B2 6F3D86 588D43 352879 B8C76F 6F4F25 433900 9A6759 444444 6C6C6C 9AD284 6C5EB5 959595",
+    "colodore": "000000 FFFFFF 813338 75CEC8 8E3C97 56AC4D 2E2C9B EDF171 8E5029 553800 C46C71 4A4A4A 7B7B7B A9FF9F 706DEB B2B2B2",
+    "vice": "000000 FDFEFC BE1A24 30E6C6 B41AE2 1FD21E 211BAE DFF60A B84104 6A3304 FE4A57 424540 70746F 59FE59 5F53FE A4A7A2",
+    "community-colors": "000000 FFFFFF AF2A29 62D8CC B03FB6 4AC64A 3739C4 E4ED4E B6591C 683808 EA746C 4D4D4D 848484 A6FA9E 707CE6 B6B6B5",
+    "deekay": "000000 FFFFFF 882000 68D0A8 A838A0 50B818 181090 F0E858 A04800 472B1B C87870 484848 808080 98FF98 5090D0 B8B8B8",
+    "pepto-palold": "000000 FFFFFF 58291D 91C6D5 915CA8 588D43 352879 B8C76F 916F43 433900 9A6759 353535 747474 9AD284 7466BE B8B8B8",
+    "ptoing": "000000 FFFFFF 8C3E34 7ABFC7 8D47B3 68A941 3E31A2 D0DC71 905F25 574200 BB776D 545454 808080 ACEA88 7C70DA ABABAB",
+    "c64hq": "0A0A0A FFF8FF 851F02 65CDA8 A73B9F 4DAB19 1A0C92 EBE353 A94B02 441E00 D28074 464646 8B8B8B 8EF68E 4D91D1 BABABA",
+    "ccs64": "101010 FFFFFF E04040 60FFFF E060E0 40E040 4040E0 FFFF40 E0A040 9C7448 FFA0A0 545454 888888 A0FFA0 A0A0FF C0C0C0",
+    "frodo": "000000 FFFFFF CC0000 00FFCC FF00FF 00CC00 0000CC FFFF00 FF8800 884400 FF8888 444444 888888 88FF88 8888FF CCCCCC",
+    "godot": "000000 FFFFFF 880000 AAFFEE CC44CC 00CC55 0000AA EEEE77 DD8855 664400 FE7777 333333 777777 AAFF66 0088FF BBBBBB",
+    "pc64": "212121 FFFFFF B52121 73FFFF B521B5 21B521 2121B5 FFFF21 B57321 944221 FF7373 737373 949494 73FF73 7373FF B5B5B5",
+    "c64s": "000000 FCFCFC A80000 54FCFC A800A8 00A800 0000A8 FCFC00 A85400 802C00 FC5454 545454 808080 54FC54 5454FC A8A8A8",
+    "pepto-ntsc": "000000 FFFFFF 67372B 70A3B1 6F3D86 588C42 342879 B7C66E 6F4E25 423800 996659 434343 6B6B6B 9AD183 6B5EB5 959595",
+    "pepto-ntsc-sony": "000000 FFFFFF 7C352B 5AA6B1 694185 5D8643 212E78 CFBE6F 894A26 5B3300 AF6459 434343 6B6B6B A0CB84 5665B3 959595",
+}
+
+PALETTES = {
+    name: [tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)) for h in row.split()]
+    for name, row in _PALETTE_HEX.items()
+}
+
+FAR_DELTA_E = 20.0   # beyond this from every palette entry: probably not C64 art
+MAX_COLOURS = 256    # more distinct colours than this: a photo, not pixel art
+SIZES = ((160, 200), (320, 200))
+
+
+class LintError(Exception):
+    """Bad input or usage: reported with '!!' and exit code 2."""
+
+
+# ---------- colour maths ------------------------------------------------------
+
+def rgb_to_lab(rgb):
+    """sRGB (0-255) -> CIE Lab (D65)."""
+    def lin(c):
+        c /= 255.0
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(c) for c in rgb)
+    x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883
+
+    def f(t):
+        return t ** (1 / 3) if t > 216 / 24389 else (24389 / 27 * t + 16) / 116
+    fx, fy, fz = f(x), f(y), f(z)
+    return (116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
+
+
+def delta_e(a, b):
+    """CIE76 colour difference between two Lab colours."""
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+
+
+# ---------- input -------------------------------------------------------------
+
+def load_png(path):
+    """Return (RGB image, notes), or raise LintError with a readable reason.
+
+    notes are warnings for the report (e.g. an animated PNG)."""
+    path = Path(path)
+    if path.is_dir():
+        raise LintError(f"{path}: is a directory, not a picture")
+    if not path.is_file():
+        raise LintError(f"{path}: file not found")
+    notes = []
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            img = Image.open(path)
+        fmt = img.format
+    except Exception as e:  # Pillow raises many types for broken files
+        raise LintError(f"{path}: not a readable PNG ({e})") from None
+    if fmt != "PNG":
+        raise LintError(f"{path}: is {fmt or 'not an image'}, c64lint reads PNG only")
+    if img.size not in SIZES:          # checked before decoding a huge file
+        w, h = img.size
+        raise LintError(f"{path}: picture is {w}x{h}; C64 bitmaps are 320x200 "
+                        "(multicolour also 160x200)")
+    if getattr(img, "n_frames", 1) > 1:
+        notes.append(f"animated PNG with {img.n_frames} frames: only the first frame "
+                     "is checked")
+    try:
+        img.load()
+    except Exception as e:
+        raise LintError(f"{path}: not a readable PNG ({e})") from None
+    if img.mode.startswith("I"):        # 16-bit greyscale: scale, don't clip
+        img = img.convert("I").point(lambda v: v * (1 / 257)).convert("L")
+    if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
+        rgba = img.convert("RGBA")
+        alpha = rgba.getchannel("A")
+        lo, _ = alpha.getextrema()
+        if lo < 255:
+            n = sum(1 for a in _pixels(alpha) if a < 255)
+            raise LintError(f"{path}: {n} transparent pixel(s); C64 pictures have no "
+                            "transparency - flatten onto the background colour first")
+        img = rgba
+    return img.convert("RGB"), notes
+
+
+# ---------- analysis ----------------------------------------------------------
+
+def _pixels(img):
+    """Flat pixel list; getdata() is deprecated from Pillow 12."""
+    get = getattr(img, "get_flattened_data", None) or img.getdata
+    return get()
+
+
+class Analysis:
+    """Everything c64lint knows about one picture; built by analyse()."""
+
+
+def detect_palette(colours, force=None):
+    """Pick the palette whose entries sit closest to the picture's colours."""
+    labs = {c: rgb_to_lab(c) for c in colours}
+    if force:
+        return force
+    best = None
+    for name, pal in PALETTES.items():
+        plab = [rgb_to_lab(p) for p in pal]
+        score = sum(min(delta_e(labs[c], p) for p in plab) for c in colours)
+        if best is None or score < best[0] - 1e-9:
+            best = (score, name)
+    return best[1]
+
+
+def analyse(img, mode, palette=None, bg=None):
+    w, h = img.size
+    if mode == "mc" and (w, h) not in ((160, 200), (320, 200)):
+        raise LintError(f"picture is {w}x{h}; multicolour needs 160x200 or 320x200")
+    if mode == "hires" and (w, h) != (320, 200):
+        raise LintError(f"picture is {w}x{h}; hires needs 320x200")
+
+    a = Analysis()
+    a.mode, a.size = mode, (w, h)
+    rgb = list(_pixels(img))
+
+    # 1. palette
+    first, counts = {}, {}
+    for i, c in enumerate(rgb):
+        if c not in first:
+            first[c] = (i % w, i // w)
+        counts[c] = counts.get(c, 0) + 1
+    if len(first) > MAX_COLOURS:
+        raise LintError(f"picture has {len(first)} different colours; a C64 picture has "
+                        "16. This looks like a photo or a scaled image - c64lint checks "
+                        "pixel art. Convert it to C64 colours first (e.g. Dithertron, "
+                        "Retropixels), then check the result")
+    a.palette = detect_palette(list(first), palette)
+    pal = PALETTES[a.palette]
+    a.rgb = pal
+    plab = [rgb_to_lab(p) for p in pal]
+    a.de = [[delta_e(p, q) for q in plab] for p in plab]
+    exact = {p: i for i, p in reversed(list(enumerate(pal)))}
+    snap, a.off_palette = {}, []
+    for c in first:
+        if c in exact:
+            snap[c] = exact[c]
+            continue
+        lab = rgb_to_lab(c)
+        dists = [delta_e(lab, p) for p in plab]
+        idx = min(range(16), key=lambda k: (dists[k], k))
+        snap[c] = idx
+        a.off_palette.append({
+            "rgb": "#%02X%02X%02X" % c, "count": counts[c], "first": list(first[c]),
+            "nearest": idx, "delta_e": round(dists[idx], 2),
+            "far": dists[idx] > FAR_DELTA_E,
+        })
+    a.off_palette.sort(key=lambda o: (o["first"][1], o["first"][0]))
+    grid = [snap[c] for c in rgb]          # palette index per input pixel
+
+    # 2. pixel pairs -> logical grid (one entry per C64 pixel)
+    a.pairs = []
+    if mode == "mc" and w == 320:
+        lw = 160
+        logical = []
+        cell_counts = {}           # (cx, cy) -> {colour: pixels}, built on demand
+        for y in range(h):
+            row = grid[y * w:(y + 1) * w]
+            for lx in range(lw):
+                p0, p1 = row[2 * lx], row[2 * lx + 1]
+                if p0 == p1:
+                    logical.append(p0)
+                    continue
+                a.pairs.append({"x": 2 * lx, "y": y, "colours": sorted((p0, p1))})
+                key = (lx // 4, y // 8)
+                counts_here = cell_counts.get(key)
+                if counts_here is None:
+                    counts_here = {}
+                    for yy in range(key[1] * 8, key[1] * 8 + 8):
+                        for v in grid[yy * w + key[0] * 8:yy * w + key[0] * 8 + 8]:
+                            counts_here[v] = counts_here.get(v, 0) + 1
+                    cell_counts[key] = counts_here
+                n0, n1 = counts_here.get(p0, 0), counts_here.get(p1, 0)
+                logical.append(p0 if (n0, -p0) > (n1, -p1) else p1)
+    else:
+        lw = w
+        logical = grid
+    a.lw = lw
+    a.logical = logical
+
+    # 3./4. cells
+    cw = 4 if mode == "mc" else 8
+    a.cell_w = cw
+    hists = []
+    for cy in range(25):
+        for cx in range(40):
+            hist = {}
+            for y in range(cy * 8, cy * 8 + 8):
+                base = y * lw + cx * cw
+                for v in logical[base:base + cw]:
+                    hist[v] = hist.get(v, 0) + 1
+            hists.append(tuple(sorted(hist.items())))
+    a.hists = hists
+
+    de = palette_de(pal)
+    memo = {}
+
+    def cell_fix(hist, b):
+        key = (hist, b)
+        if key not in memo:
+            memo[key] = best_set(hist, b, de)
+        return memo[key]
+
+    if mode == "mc":
+        totals = [0] * 16
+        for v in logical:
+            totals[v] += 1
+        ranking = []
+        # a forced background is the user's decision: costing the other 15
+        # is most of the run time on busy pictures, so it is skipped
+        for b in (range(16) if bg is None else (bg,)):
+            cost = bad = 0
+            for hist in hists:
+                c, _ = cell_fix(hist, b)
+                if c is not None:
+                    cost += c
+                    bad += 1
+            ranking.append({"bg": b, "cost": round(cost, 2), "bad_cells": bad,
+                            "_key": (round(cost, 6), bad, -totals[b], b)})
+        ranking.sort(key=lambda r: r["_key"])
+        for r in ranking:
+            del r["_key"]
+        a.bg_ranking = ranking
+        a.bg = ranking[0]["bg"] if bg is None else bg
+    else:
+        a.bg_ranking = []
+        a.bg = None
+
+    a.cells = []
+    for i, hist in enumerate(hists):
+        cost, keep = cell_fix(hist, a.bg)
+        if cost is None:
+            continue
+        cols = dict(hist)
+        changed = sum(n for c, n in hist if c not in keep)
+        a.cells.append({
+            "cx": i % 40, "cy": i // 40,
+            "x": (i % 40) * cw * (w // lw), "y": (i // 40) * 8,
+            "colours": {str(c): n for c, n in sorted(cols.items(), key=lambda t: (-t[1], t[0]))},
+            "surplus": sorted(c for c in cols if c not in keep),
+            "fix": {"keep": list(keep), "changed": changed, "cost": round(cost, 2)},
+        })
+    a.clean = not (a.off_palette or a.pairs or a.cells)
+    return a
+
+
+def palette_de(pal):
+    """16x16 table of CIE76 distances between a palette's colours."""
+    plab = [rgb_to_lab(p) for p in pal]
+    return tuple(tuple(delta_e(p, q) for q in plab) for p in plab)
+
+
+def best_set(hist, bg, de):
+    """Cheapest legal colour set for one cell, by exhaustive search.
+
+    hist is the cell's sorted ((colour, count), ...); bg is the background
+    (None for hires). Returns (None, None) when the cell is already legal,
+    else (cost, keep): keep is the sorted tuple of colours the cell may keep
+    (for multicolour it includes the background). Only the cell's own colours
+    are candidates. Ties go to the smallest keep tuple."""
+    colours = [c for c, _ in hist]
+    if bg is None:                        # hires: two colours per cell
+        if len(colours) <= 2:
+            return None, None
+        pool, k, fixed = colours, 2, ()
+    else:                                 # multicolour: background + three
+        pool = [c for c in colours if c != bg]
+        if len(pool) <= 3:
+            return None, None
+        k, fixed = 3, (bg,)
+    # biggest contributions first, so the running total passes the bound early
+    rows = [(c, n, de[c]) for c, n in sorted(hist, key=lambda t: -t[1])]
+
+    def cost_of(keep, bound):
+        cost = 0.0
+        if len(keep) == 4:
+            k0, k1, k2, k3 = keep
+            for c, n, row in rows:
+                if c != k0 and c != k1 and c != k2 and c != k3:
+                    cost += n * min(row[k0], row[k1], row[k2], row[k3])
+                    if cost > bound + 1e-9:
+                        return None
+        else:
+            k0, k1 = keep
+            for c, n, row in rows:
+                if c != k0 and c != k1:
+                    cost += n * min(row[k0], row[k1])
+                    if cost > bound + 1e-9:
+                        return None
+        return cost
+
+    # seed the bound with the most-used colours: usually close to the answer,
+    # so most other sets are abandoned after a pixel or two
+    count = dict(hist)
+    seed = tuple(sorted(sorted(pool, key=lambda c: (-count[c], c))[:k] + list(fixed)))
+    best = (cost_of(seed, math.inf), seed)
+    for subset in itertools.combinations(pool, k):
+        keep = tuple(sorted(subset + fixed))
+        cost = cost_of(keep, best[0])
+        if cost is not None and (cost < best[0] - 1e-9 or (
+                abs(cost - best[0]) <= 1e-9 and keep < best[1])):
+            best = (cost, keep)
+    return best
+
+
+# ---------- fixing ------------------------------------------------------------
+
+def fixed_logical(a):
+    """Logical index grid with every broken cell repainted."""
+    out = list(a.logical)
+    for cell in a.cells:
+        keep = cell["fix"]["keep"]
+        for y in range(cell["cy"] * 8, cell["cy"] * 8 + 8):
+            base = y * a.lw + cell["cx"] * a.cell_w
+            for i in range(base, base + a.cell_w):
+                v = out[i]
+                if v not in keep:
+                    out[i] = min(keep, key=lambda q: (a.de[v][q], q))
+    return out
+
+
+def render(a, logical):
+    """Logical index grid -> RGB image at the input resolution."""
+    lw, (w, h) = a.lw, a.size
+    img = Image.new("RGB", (lw, h))
+    img.putdata([a.rgb[v] for v in logical])
+    if lw != w:
+        img = img.resize((w, h), Image.NEAREST)
+    return img
+
+
+def encode_koala(a, logical, bg):
+    """Koala (.kla) bytes from a legal multicolour logical grid."""
+    bitmap, screen, colram = bytearray(8000), bytearray(1000), bytearray(1000)
+    for cy in range(25):
+        for cx in range(40):
+            cell = cy * 40 + cx
+            used = sorted({logical[y * 160 + cx * 4 + x]
+                           for y in range(cy * 8, cy * 8 + 8) for x in range(4)} - {bg})
+            if len(used) > 3:
+                raise LintError(f"internal: cell ({cx},{cy}) still has {len(used)} colours")
+            used += [0] * (3 - len(used))
+            screen[cell] = (used[0] << 4) | used[1]
+            colram[cell] = used[2]
+            code = {bg: 0}
+            for bits, c in zip((1, 2, 3), used):
+                code.setdefault(c, bits)
+            for ly in range(8):
+                byte = 0
+                for lx in range(4):
+                    byte = (byte << 2) | code[logical[(cy * 8 + ly) * 160 + cx * 4 + lx]]
+                bitmap[cell * 8 + ly] = byte
+    return bytes([0x00, 0x60]) + bytes(bitmap) + bytes(screen) + bytes(colram) + bytes([bg])
+
+
+def decode_koala(data, palette):
+    """Koala bytes -> 320x200 RGB image (used by the tests and for checks)."""
+    if len(data) != 10003:
+        raise LintError(f"Koala file is {len(data)} bytes, expected 10003")
+    body = data[2:]
+    bitmap, screen, colram, bg = body[:8000], body[8000:9000], body[9000:10000], body[10000] & 15
+    img = Image.new("RGB", (160, 200))
+    px = img.load()
+    for cell in range(1000):
+        cx, cy = cell % 40, cell // 40
+        cols = (bg, screen[cell] >> 4, screen[cell] & 15, colram[cell] & 15)
+        for ly in range(8):
+            byte = bitmap[cell * 8 + ly]
+            for lx in range(4):
+                px[cx * 4 + lx, cy * 8 + ly] = palette[cols[(byte >> (6 - 2 * lx)) & 3]]
+    return img.resize((320, 200), Image.NEAREST)
+
+
+# ---------- pictures for humans ------------------------------------------------
+
+SCALE = 5
+MARK = 2   # size of the corner marks on a scaled pixel
+
+
+def _dim(img, factor=0.35):
+    return Image.eval(img, lambda v: int(v * factor))
+
+
+def _mark(draw, x, y, colour, corner):
+    """Small square in one corner of scaled input pixel (x, y); the rest of
+    the pixel keeps its own colour, so the mark never hides what it marks."""
+    px, py = x * SCALE, y * SCALE
+    if corner == "br":
+        px, py = px + SCALE - MARK, py + SCALE - MARK
+    draw.rectangle((px, py, px + MARK - 1, py + MARK - 1), fill=colour)
+
+
+def _box(draw, x0, y0, x1, y1, colour):
+    """Frame drawn just OUTSIDE input pixels x0..x1-1, y0..y1-1."""
+    draw.rectangle((x0 * SCALE - 1, y0 * SCALE - 1, x1 * SCALE, y1 * SCALE), outline=colour)
+
+
+def overlay(a, src):
+    """Input scaled x5: clean areas dimmed; broken cells at full brightness,
+    framed red, surplus pixels marked magenta (top-left corner); off-palette
+    pixels marked cyan (bottom-right); split pairs framed yellow."""
+    w, h = a.size
+    big = src.resize((w * SCALE, h * SCALE), Image.NEAREST)
+    out = _dim(big)
+    draw = ImageDraw.Draw(out)
+    sx = w // a.lw                                      # input px per C64 px
+    for cell in a.cells:
+        x0, y0 = cell["cx"] * a.cell_w * sx, cell["cy"] * 8
+        box = (x0 * SCALE, y0 * SCALE, (x0 + a.cell_w * sx) * SCALE, (y0 + 8) * SCALE)
+        out.paste(big.crop(box), box[:2])
+    for cell in a.cells:
+        x0, y0 = cell["cx"] * a.cell_w * sx, cell["cy"] * 8
+        keep = cell["fix"]["keep"]
+        for y in range(y0, y0 + 8):
+            for lx in range(a.cell_w):
+                if a.logical[y * a.lw + cell["cx"] * a.cell_w + lx] not in keep:
+                    for dx in range(sx):
+                        _mark(draw, (cell["cx"] * a.cell_w + lx) * sx + dx, y,
+                              (255, 0, 255), "tl")
+        _box(draw, x0, y0, x0 + a.cell_w * sx, y0 + 8, (255, 0, 0))
+    px = src.load()
+    off = {o["rgb"] for o in a.off_palette}
+    if off:
+        for y in range(h):
+            for x in range(w):
+                if "#%02X%02X%02X" % px[x, y] in off:
+                    _mark(draw, x, y, (0, 255, 255), "br")
+    for p in a.pairs:
+        _box(draw, p["x"], p["y"], p["x"] + 2, p["y"] + 1, (255, 255, 0))
+    return out
+
+
+def diff_image(before, after):
+    """Before and after side by side, scaled x5. Pixels the fix changed are
+    at full brightness on both sides (old colour left, new colour right) with
+    a white corner mark; everything unchanged is dimmed."""
+    w, h = after.size
+    gap = 4 * SCALE
+    out = Image.new("RGB", (2 * w * SCALE + gap, h * SCALE), (40, 40, 40))
+    sides = []
+    for i, img in enumerate((before, after)):
+        big = img.resize((w * SCALE, h * SCALE), Image.NEAREST)
+        left = i * (w * SCALE + gap)
+        out.paste(_dim(big), (left, 0))
+        sides.append((big, left))
+    draw = ImageDraw.Draw(out)
+    b, f = before.load(), after.load()
+    for y in range(h):
+        for x in range(w):
+            if b[x, y] != f[x, y]:
+                for big, left in sides:
+                    box = (x * SCALE, y * SCALE, (x + 1) * SCALE, (y + 1) * SCALE)
+                    out.paste(big.crop(box), (left + box[0], box[1]))
+                    draw.rectangle((left + box[0], box[1], left + box[0] + MARK - 1,
+                                    box[1] + MARK - 1), fill=(255, 255, 255))
+    return out
+
+
+# ---------- report ------------------------------------------------------------
+
+def _name(i):
+    return f"{i} {COLOUR_NAMES[i]}"
+
+
+OFF_PALETTE_LINES = 10
+
+
+def print_report(a, path, palette_forced, bg_forced, notes=()):
+    mode = "multicolour" if a.mode == "mc" else "hires"
+    w, h = a.size
+    how = "forced" if palette_forced else "detected"
+    print(f"[*] {path}: {w}x{h} {mode}, palette {a.palette} ({how})")
+    for n in notes:
+        print(f"[!] {n}")
+    for o in a.off_palette[:OFF_PALETTE_LINES]:
+        far = " - far from every C64 colour, is this C64 art?" if o["far"] else ""
+        print(f"[!] off-palette {o['rgb']} x{o['count']} first at ({o['first'][0]},{o['first'][1]}):"
+              f" nearest {_name(o['nearest'])}, dE {o['delta_e']}{far}")
+    if len(a.off_palette) > OFF_PALETTE_LINES:
+        print(f"[!] ... and {len(a.off_palette) - OFF_PALETTE_LINES} more off-palette "
+              "colour(s); --json lists them all")
+    if a.pairs:
+        p = a.pairs[0]
+        print(f"[!] {len(a.pairs)} pixel pair(s) with two different colours (multicolour "
+              f"pixels are 2 wide), first at ({p['x']},{p['y']}): "
+              f"{_name(p['colours'][0])} / {_name(p['colours'][1])}")
+    if a.mode == "mc":
+        if not bg_forced:
+            top = ", ".join(f"{_name(r['bg'])} ({r['bad_cells']} bad, cost {r['cost']})"
+                            for r in a.bg_ranking[:5])
+            print(f"[*] background ranking: {top}")
+        src = "forced with --bg; ranking skipped" if bg_forced else "best"
+        print(f"[*] background: {_name(a.bg)} ({src})")
+    for c in a.cells:
+        cols = ", ".join(f"{_name(int(k))} x{n}" for k, n in c["colours"].items())
+        sur = ", ".join(_name(s) for s in c["surplus"])
+        print(f"[!] cell ({c['cx']},{c['cy']}) at x={c['x']} y={c['y']}: {cols}; "
+              f"surplus: {sur}; fix repaints {c['fix']['changed']} C64 pixel(s)")
+    if a.clean:
+        print("[*] CLEAN: fits the mode as drawn")
+    else:
+        bits = []
+        if a.off_palette:
+            bits.append(f"{len(a.off_palette)} off-palette colour(s)")
+        if a.pairs:
+            bits.append(f"{len(a.pairs)} split pair(s)")
+        if a.cells:
+            bits.append(f"{len(a.cells)} broken cell(s)")
+        print(f"[!] NOT CLEAN: {', '.join(bits)}")
+
+
+def report_json(a, path):
+    return {
+        "version": 1, "tool": f"c64lint {VERSION}", "file": str(path),
+        "mode": a.mode, "palette": a.palette, "bg": a.bg,
+        "bg_ranking": a.bg_ranking, "off_palette": a.off_palette,
+        "pairs": a.pairs, "cells": a.cells, "clean": a.clean,
+    }
+
+
+# ---------- command line --------------------------------------------------------
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="c64lint",
+        description="Check a PNG against C64 bitmap mode rules and explain the clashes.")
+    ap.add_argument("--version", action="version", version=f"c64lint {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check", help="check a picture")
+    c.add_argument("png")
+    c.add_argument("--mode", required=True, choices=["mc", "hires"])
+    c.add_argument("--palette", choices=list(PALETTES), help="skip detection")
+    c.add_argument("--bg", type=int, choices=range(16), metavar="0-15",
+                   help="background colour ($d021) instead of the best one")
+    c.add_argument("--overlay", metavar="OUT.png")
+    c.add_argument("--json", metavar="OUT.json")
+    c.add_argument("--fix", metavar="OUT.png")
+    c.add_argument("--kla", metavar="OUT.kla", help="Koala file (multicolour only)")
+    c.add_argument("--then", choices=["png2prg"],
+                   help="run png2prg on the clean result; its args go after --")
+    sub.add_parser("palettes", help="list built-in palettes")
+    return ap
+
+
+def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        try:   # a Hebrew or accented path must not crash a redirected console
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    argv = list(sys.argv[1:] if argv is None else argv)
+    then_args = []
+    if "--then" in argv and "--" in argv:
+        i = argv.index("--")
+        argv, then_args = argv[:i], argv[i + 1:]
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 2
+    if args.cmd == "palettes":
+        for name in PALETTES:
+            print(name)
+        return 0
+    try:
+        return check(args, then_args)
+    except LintError as e:
+        print(f"!! {e}")
+        return 2
+
+
+def _same_file(p, q):
+    """True if p and q name the same file however they are spelled: case,
+    relative or absolute, long-path or UNC prefixes, hardlinks."""
+    try:
+        if os.path.normcase(str(p.resolve())) == os.path.normcase(str(q.resolve())):
+            return True
+    except OSError:
+        pass
+    try:
+        return p.exists() and q.exists() and os.path.samefile(p, q)
+    except OSError:
+        return False
+
+
+def plan_outputs(args, src_path):
+    """Every file this run will write, checked before anything is written.
+
+    Refuses (LintError, exit 2) an output that is the input picture, two
+    outputs on one file, a picture output that is not .png, a directory, or
+    a folder that does not exist - so a refused run writes nothing at all."""
+    outs = []
+    for flag, value in (("--json", args.json), ("--overlay", args.overlay),
+                        ("--fix", args.fix), ("--kla", args.kla)):
+        if value:
+            outs.append((flag, Path(value)))
+    if args.fix:
+        outs.append(("--fix (its .diff.png)", Path(args.fix).with_suffix(".diff.png")))
+    for flag, path in outs:
+        if flag in ("--fix", "--overlay") and path.suffix.lower() != ".png":
+            raise LintError(f"{flag} {path}: must be a .png file")
+        if path.is_dir():
+            raise LintError(f"{flag} {path}: is a directory")
+        if not path.resolve().parent.is_dir():
+            raise LintError(f"{flag} {path}: folder {path.resolve().parent} does not exist")
+        if _same_file(path, src_path):
+            raise LintError(f"{flag} {path}: that is the input picture - c64lint never "
+                            "writes over your picture; choose another name")
+    for (f1, p1), (f2, p2) in itertools.combinations(outs, 2):
+        if _same_file(p1, p2):
+            raise LintError(f"{f1} and {f2} both write {p2}; give them different names")
+    return dict(outs)
+
+
+def _write(path, writer):
+    try:
+        writer(path)
+    except (OSError, ValueError) as e:
+        raise LintError(f"could not write {path}: {e}") from None
+
+
+def check(args, then_args):
+    if then_args and not args.then:
+        raise LintError("arguments after -- are only used with --then png2prg")
+    if args.kla and args.mode != "mc":
+        raise LintError("--kla writes Koala, which is multicolour; hires output: "
+                        "use --then png2prg")
+    src_path = Path(args.png)
+    outs = plan_outputs(args, src_path)
+    img, notes = load_png(src_path)
+    if args.bg is not None and args.mode == "hires":
+        notes.append("--bg ignored: hires has no shared background colour")
+        args.bg = None
+    a = analyse(img, args.mode, args.palette, args.bg)
+    print_report(a, src_path, args.palette is not None, args.bg is not None, notes)
+
+    if args.json:
+        text = json.dumps(report_json(a, src_path), indent=1) + "\n"
+        _write(outs["--json"], lambda p: p.write_text(text, encoding="utf-8"))
+        print(f"[*] wrote {args.json}")
+    if args.overlay:
+        _write(outs["--overlay"], overlay(a, img).save)
+        print(f"[*] wrote {args.overlay}")
+
+    clean_png = src_path if a.clean else None
+    clean_logical = a.logical if a.clean else None
+    if args.fix:
+        fl = fixed_logical(a)
+        fixed = render(a, fl)
+        _write(outs["--fix"], fixed.save)
+        diff_path = outs["--fix (its .diff.png)"]
+        _write(diff_path, diff_image(img, fixed).save)
+        print(f"[*] wrote {args.fix} and {diff_path}")
+        clean_png = clean_png or Path(args.fix)
+        clean_logical = clean_logical or fl
+
+    if args.kla:
+        if clean_logical is None:
+            print("[!] --kla not written: the picture is not clean; add --fix to "
+                  "write the fixed picture as Koala")
+        else:
+            data = encode_koala(a, clean_logical, a.bg)
+            _write(outs["--kla"], lambda p: p.write_bytes(data))
+            print(f"[*] wrote {args.kla}")
+
+    if args.then:
+        exe = shutil.which("png2prg")
+        if exe is None:
+            raise LintError(f"png2prg not found on PATH - get it from {PNG2PRG_URL}")
+        if clean_png is None:
+            print("[!] png2prg not run: the picture is not clean; add --fix to run it "
+                  "on the fixed picture")
+        else:
+            cmd = [exe, *then_args, str(clean_png)]
+            print(f"[*] running {' '.join(cmd)}")
+            try:
+                result = subprocess.run(cmd)
+            except OSError as e:
+                raise LintError(f"could not start png2prg ({exe}): {e}") from None
+            if result.returncode != 0:
+                raise LintError("png2prg failed (see its output above)")
+    return 0 if a.clean else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
