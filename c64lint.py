@@ -22,9 +22,9 @@ import tempfile
 import warnings
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
-VERSION = "0.1.0"
+VERSION = "1.0.0"
 PNG2PRG_URL = "https://github.com/staD020/png2prg"
 
 COLOUR_NAMES = [
@@ -67,6 +67,7 @@ for _pal in PALETTES.values():
         EXACT_ANY.setdefault(_rgb, _i)
 
 FAR_DELTA_E = 20.0   # beyond this from every palette entry: probably not C64 art
+MODE_HINT_PAIRS = 320  # this many split pairs: probably hires art in --mode mc
 MAX_COLOURS = 256    # more distinct colours than this: a photo, not pixel art
 SIZES = ((160, 200), (320, 200))
 
@@ -358,6 +359,14 @@ def analyse(img, mode, palette=None, bg=None):
             "surplus": sorted(c for c in cols if c not in keep),
             "fix": {"keep": list(keep), "changed": changed, "cost": round(cost, 2)},
         })
+    if mode == "mc" and len(a.pairs) >= MODE_HINT_PAIRS:
+        a.notes.append(f"{len(a.pairs)} split pixel pairs: this looks like a hires picture - "
+                       "if it is, check it with --mode hires")
+    if mode == "hires" and a.cells and all(
+            grid[i] == grid[i + 1] for i in range(0, len(grid), 2)):
+        a.notes.append(f"every pixel is 2 wide and {len(a.cells)} cell(s) break the hires "
+                       "rules: this looks like a multicolour picture - if it is, check it "
+                       "with --mode mc")
     a.clean = not (a.off_palette or a.pairs or a.cells)
     return a
 
@@ -549,6 +558,26 @@ def overlay(a, src):
 
 
 DIFF_GAP = 4 * SCALE
+DIFF_TOP = 40          # label strip above the before/after halves
+ZOOM_LABEL = 40        # caption strip above the zoom panel
+LABEL = (230, 230, 230)
+
+
+def _label_font():
+    """Pillow's built-in bitmap font: the same pixels with or without
+    FreeType, so the slim exe draws exactly what the source draws."""
+    load = getattr(ImageFont, "load_default_imagefont", None)
+    return load() if load else ImageFont.load_default()
+
+
+def _label(out, x, y, text, scale=3, colour=LABEL):
+    """Draw text at (x, y), scaled up crisp (nearest neighbour)."""
+    font = _label_font()
+    x0, y0, x1, y1 = font.getbbox(text)
+    tmp = Image.new("L", (x1 + 1, y1 + 1), 0)
+    ImageDraw.Draw(tmp).text((0, 0), text, fill=255, font=font)
+    tmp = tmp.resize((tmp.width * scale, tmp.height * scale), Image.NEAREST)
+    out.paste(Image.new("RGB", tmp.size, colour), (x, y), tmp)
 DIFF_FRAME = (255, 0, 255)
 ZOOM_MAX, ZOOM_MAX_HEIGHT = 16, 600
 
@@ -566,7 +595,8 @@ def _zoom_layout(w, h, changed, cell):
     half = w * SCALE
     z = max(1, min(ZOOM_MAX, half // (bx1 - bx0), ZOOM_MAX_HEIGHT // (by1 - by0)))
     pad = (half - (bx1 - bx0) * z) // 2
-    return z, (bx0, by0, bx1, by1), pad, half + DIFF_GAP + pad, h * SCALE + DIFF_GAP
+    return (z, (bx0, by0, bx1, by1), pad, half + DIFF_GAP + pad,
+            DIFF_TOP + h * SCALE + ZOOM_LABEL)
 
 
 def diff_zoom_geometry(diff, changed, cell):
@@ -589,7 +619,7 @@ def diff_image(before, after, cell=8):
     b, f = before.load(), after.load()
     changed = [(x, y) for y in range(h) for x in range(w) if b[x, y] != f[x, y]]
     zoom = _zoom_layout(w, h, changed, cell) if changed else None
-    height = h * SCALE
+    height = DIFF_TOP + h * SCALE
     if zoom:
         z, (bx0, by0, bx1, by1), lx, rx, top = zoom
         height = top + (by1 - by0) * z + DIFF_GAP
@@ -599,16 +629,20 @@ def diff_image(before, after, cell=8):
         big = img.resize((w * SCALE, h * SCALE), Image.NEAREST)
         grey = big.convert("L").point(lambda v: int(v * 0.3)).convert("RGB")
         left = i * (w * SCALE + DIFF_GAP)
-        out.paste(grey, (left, 0))
+        out.paste(grey, (left, DIFF_TOP))
         sides.append((big, left))
+    _label(out, 4, 4, "BEFORE")
+    _label(out, w * SCALE + DIFF_GAP + 4, 4,
+           "AFTER --fix    magenta = cells the fix changed" if changed
+           else "AFTER --fix    nothing changed")
     draw = ImageDraw.Draw(out)
     for x, y in changed:
         for big, left in sides:
             box = (x * SCALE, y * SCALE, (x + 1) * SCALE, (y + 1) * SCALE)
-            out.paste(big.crop(box), (left + box[0], box[1]))
+            out.paste(big.crop(box), (left + box[0], DIFF_TOP + box[1]))
     for cx, cy in sorted({(x // cell, y // 8) for x, y in changed}):
         for _, left in sides:
-            x0, y0 = left + cx * cell * SCALE, cy * 8 * SCALE
+            x0, y0 = left + cx * cell * SCALE, DIFF_TOP + cy * 8 * SCALE
             x1, y1 = x0 + cell * SCALE, y0 + 8 * SCALE
             for k in (1, 2):                       # 2-pixel frame outside the cell
                 draw.rectangle((x0 - k, y0 - k, x1 - 1 + k, y1 - 1 + k), outline=DIFF_FRAME)
@@ -617,18 +651,28 @@ def diff_image(before, after, cell=8):
             crop = img.crop((bx0, by0, bx1, by1)).resize(((bx1 - bx0) * z, (by1 - by0) * z),
                                                          Image.NEAREST)
             out.paste(crop, (px0, top))
-            if z >= 6:      # outline the edge of each changed area, not every pixel
+            # outline the edge of each changed area, thin enough that a one
+            # pixel wide run still shows its colour inside the outline
+            t = 2 if z >= 16 else 1
+            if z < 8:       # too small to outline inside: ring around the pixel
+                for x, y in changed:
+                    qx, qy = px0 + (x - bx0) * z, top + (y - by0) * z
+                    draw.rectangle((qx - 2 * z, qy - 2 * z, qx + 3 * z - 1, qy + 3 * z - 1),
+                                   outline=DIFF_FRAME)
+            else:
                 cset = set(changed)
                 for x, y in changed:
                     qx, qy = px0 + (x - bx0) * z, top + (y - by0) * z
                     if (x - 1, y) not in cset:
-                        draw.rectangle((qx, qy, qx + 1, qy + z - 1), fill=DIFF_FRAME)
+                        draw.rectangle((qx, qy, qx + t - 1, qy + z - 1), fill=DIFF_FRAME)
                     if (x + 1, y) not in cset:
-                        draw.rectangle((qx + z - 2, qy, qx + z - 1, qy + z - 1), fill=DIFF_FRAME)
+                        draw.rectangle((qx + z - t, qy, qx + z - 1, qy + z - 1), fill=DIFF_FRAME)
                     if (x, y - 1) not in cset:
-                        draw.rectangle((qx, qy, qx + z - 1, qy + 1), fill=DIFF_FRAME)
+                        draw.rectangle((qx, qy, qx + z - 1, qy + t - 1), fill=DIFF_FRAME)
                     if (x, y + 1) not in cset:
-                        draw.rectangle((qx, qy + z - 2, qx + z - 1, qy + z - 1), fill=DIFF_FRAME)
+                        draw.rectangle((qx, qy + z - t, qx + z - 1, qy + z - 1), fill=DIFF_FRAME)
+        _label(out, 4, top - ZOOM_LABEL + 8, f"ZOOM x{z} - before", scale=2)
+        _label(out, w * SCALE + DIFF_GAP + 4, top - ZOOM_LABEL + 8, f"ZOOM x{z} - after", scale=2)
     return out
 
 
@@ -647,6 +691,7 @@ def _name(i):
 
 
 OFF_PALETTE_LINES = 10
+CELL_LINES = 20
 
 
 def print_report(a, path, palette_forced, bg_forced, notes=()):
@@ -677,11 +722,14 @@ def print_report(a, path, palette_forced, bg_forced, notes=()):
         print(f"[*] background: {_name(a.bg)} ({src})")
         if a.bg_note:
             print(f"[!] {a.bg_note}")
-    for c in a.cells:
+    for c in a.cells[:CELL_LINES]:
         cols = ", ".join(f"{_name(int(k))} x{n}" for k, n in c["colours"].items())
         sur = ", ".join(_name(s) for s in c["surplus"])
         print(f"[!] cell ({c['cx']},{c['cy']}) at x={c['x']} y={c['y']}: {cols}; "
               f"surplus: {sur}; fix repaints {c['fix']['changed']} C64 pixel(s)")
+    if len(a.cells) > CELL_LINES:
+        print(f"[!] ... and {len(a.cells) - CELL_LINES} more broken cell(s); "
+              "--json lists them all")
     if a.clean:
         print("[*] CLEAN: fits the mode as drawn")
     else:
@@ -707,25 +755,46 @@ def report_json(a, path, notes=()):
 
 # ---------- command line --------------------------------------------------------
 
+EXIT_CODES = """Exit codes:
+  0  clean: the picture fits the mode as drawn
+  1  problems found (also when --fix fixed them)
+  2  bad input or bad options - nothing was written
+  3  png2prg (--then) failed"""
+
+
 def build_parser():
+    fmt = argparse.RawDescriptionHelpFormatter
     ap = argparse.ArgumentParser(
-        prog="c64lint", allow_abbrev=False,
-        description="Check a PNG against C64 bitmap mode rules and explain the clashes.")
+        prog="c64lint", allow_abbrev=False, formatter_class=fmt,
+        description="Check a PNG drawn for the C64 against bitmap mode rules, explain "
+                    "every clash and write the cheapest fix.",
+        epilog="Start with:  c64lint check pic.png --mode mc --overlay ov.png --fix fixed.png"
+               "\n\n" + EXIT_CODES)
     ap.add_argument("--version", action="version", version=f"c64lint {VERSION}")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("check", help="check a picture", allow_abbrev=False)
-    c.add_argument("png")
-    c.add_argument("--mode", required=True, choices=["mc", "hires"])
-    c.add_argument("--palette", choices=list(PALETTES), help="skip detection")
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="{check,palettes}")
+    c = sub.add_parser("check", help="check a picture (and optionally fix it)",
+                       allow_abbrev=False, formatter_class=fmt, epilog=EXIT_CODES,
+                       description="Check one PNG. Without output options it only reports.")
+    c.add_argument("png", help="the picture: PNG, 320x200 (multicolour also 160x200)")
+    c.add_argument("--mode", required=True, choices=["mc", "hires"],
+                   help="mc = multicolour bitmap (Koala), hires = hires bitmap")
+    c.add_argument("--palette", choices=list(PALETTES), metavar="NAME",
+                   help="use this palette instead of detecting one "
+                        "(see: c64lint palettes)")
     c.add_argument("--bg", type=int, choices=range(16), metavar="0-15",
-                   help="background colour ($d021) instead of the best one")
-    c.add_argument("--overlay", metavar="OUT.png")
-    c.add_argument("--json", metavar="OUT.json")
-    c.add_argument("--fix", metavar="OUT.png")
-    c.add_argument("--kla", metavar="OUT.kla", help="Koala file (multicolour only)")
+                   help="background colour ($d021) instead of the cheapest one "
+                        "(multicolour only)")
+    c.add_argument("--overlay", metavar="OUT.png",
+                   help="write the problems drawn over your picture, 5x size")
+    c.add_argument("--json", metavar="OUT.json",
+                   help="write the whole report as JSON")
+    c.add_argument("--fix", metavar="OUT.png",
+                   help="write the cheapest fix, plus OUT.diff.png showing what changed")
+    c.add_argument("--kla", metavar="OUT.kla",
+                   help="write a Koala file (multicolour), only from a clean result")
     c.add_argument("--then", choices=["png2prg"],
-                   help="run png2prg on the clean result; its args go after --")
-    sub.add_parser("palettes", help="list built-in palettes")
+                   help="run png2prg on the clean result; its arguments go after --")
+    sub.add_parser("palettes", help="list the built-in palettes")
     return ap
 
 
@@ -736,6 +805,9 @@ def main(argv=None):
         except (AttributeError, ValueError):
             pass
     argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        build_parser().print_help()
+        return 2
     then_args = []
     wants_then = any(x == "--then" or x.startswith("--then=") for x in argv)
     if wants_then and "--" in argv:
@@ -929,7 +1001,10 @@ def check(args, then_args):
     _commit(files)
     for w in wrote:
         print(f"[*] wrote {w}")
-    if args.fix:
+    if args.fix and n_px == 0:
+        print(f"[*] nothing to fix: the picture is already clean, so {args.fix} is "
+              "the same picture")
+    elif args.fix:
         print(f"[*] the fix changed {n_px} screen pixel(s) in {n_cells} cell(s); "
               f"{outs['--fix (its .diff.png)']} shows them framed, with a zoom underneath")
     if kla_skipped:
