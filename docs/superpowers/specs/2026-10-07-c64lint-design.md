@@ -94,6 +94,10 @@ Third review (2026-10-12, QA agent + real png2prg 1.12 + Alex's manual test):
 - Refused outputs also include NTFS streams and Windows device names. Input
   is identified by its signature before Pillow opens it. allow_abbrev off;
   --then=png2prg accepted. JSON gains `notes`.
+- .diff.png redesigned after Alex's manual test (34 changed pixels were
+  specks in a 3220x1000 image): untouched areas grey, touched cells framed
+  magenta, zoom panel of the changed area (up to 16x) with outlines on the
+  edges of changed areas only; console reports pixels/cells changed.
 
 Output safety (added after QA): every output path, including the derived
 `.diff.png`, is checked before anything is written. Same file as the input

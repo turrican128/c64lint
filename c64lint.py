@@ -548,30 +548,96 @@ def overlay(a, src):
     return out
 
 
-def diff_image(before, after):
-    """Before and after side by side, scaled x5. Pixels the fix changed are
-    at full brightness on both sides (old colour left, new colour right) with
-    a white corner mark; everything unchanged is dimmed."""
+DIFF_GAP = 4 * SCALE
+DIFF_FRAME = (255, 0, 255)
+ZOOM_MAX, ZOOM_MAX_HEIGHT = 16, 600
+
+
+def _zoom_layout(w, h, changed, cell):
+    """Where the zoom panel goes: (zoom, bbox, left x, right x, top y).
+
+    bbox is the changed area grown to whole cells plus one cell of context."""
+    xs = [x for x, _ in changed]
+    ys = [y for _, y in changed]
+    bx0 = max(0, (min(xs) // cell - 1) * cell)
+    by0 = max(0, (min(ys) // 8 - 1) * 8)
+    bx1 = min(w, (max(xs) // cell + 2) * cell)
+    by1 = min(h, (max(ys) // 8 + 2) * 8)
+    half = w * SCALE
+    z = max(1, min(ZOOM_MAX, half // (bx1 - bx0), ZOOM_MAX_HEIGHT // (by1 - by0)))
+    pad = (half - (bx1 - bx0) * z) // 2
+    return z, (bx0, by0, bx1, by1), pad, half + DIFF_GAP + pad, h * SCALE + DIFF_GAP
+
+
+def diff_zoom_geometry(diff, changed, cell):
+    """Zoom-panel geometry of a diff image (for tests and tools)."""
+    w = (diff.width - DIFF_GAP) // (2 * SCALE)
+    h = 200
+    z, box, lx, rx, top = _zoom_layout(w, h, changed, cell)
+    return z, box[:2], (lx, rx), top
+
+
+def diff_image(before, after, cell=8):
+    """What the fix changed, readable at a glance.
+
+    Top: before and after side by side, x5. Everything the fix left alone is
+    grey and dark; changed pixels keep their colour (old on the left, new on
+    the right) and every cell the fix touched is framed magenta, so the
+    changes show even as a thumbnail. Below: the changed area only, magnified
+    up to 16x, before and after, each changed pixel outlined."""
     w, h = after.size
-    gap = 4 * SCALE
-    out = Image.new("RGB", (2 * w * SCALE + gap, h * SCALE), (40, 40, 40))
+    b, f = before.load(), after.load()
+    changed = [(x, y) for y in range(h) for x in range(w) if b[x, y] != f[x, y]]
+    zoom = _zoom_layout(w, h, changed, cell) if changed else None
+    height = h * SCALE
+    if zoom:
+        z, (bx0, by0, bx1, by1), lx, rx, top = zoom
+        height = top + (by1 - by0) * z + DIFF_GAP
+    out = Image.new("RGB", (2 * w * SCALE + DIFF_GAP, height), (40, 40, 40))
     sides = []
     for i, img in enumerate((before, after)):
         big = img.resize((w * SCALE, h * SCALE), Image.NEAREST)
-        left = i * (w * SCALE + gap)
-        out.paste(_dim(big), (left, 0))
+        grey = big.convert("L").point(lambda v: int(v * 0.3)).convert("RGB")
+        left = i * (w * SCALE + DIFF_GAP)
+        out.paste(grey, (left, 0))
         sides.append((big, left))
     draw = ImageDraw.Draw(out)
-    b, f = before.load(), after.load()
-    for y in range(h):
-        for x in range(w):
-            if b[x, y] != f[x, y]:
-                for big, left in sides:
-                    box = (x * SCALE, y * SCALE, (x + 1) * SCALE, (y + 1) * SCALE)
-                    out.paste(big.crop(box), (left + box[0], box[1]))
-                    draw.rectangle((left + box[0], box[1], left + box[0] + MARK - 1,
-                                    box[1] + MARK - 1), fill=(255, 255, 255))
+    for x, y in changed:
+        for big, left in sides:
+            box = (x * SCALE, y * SCALE, (x + 1) * SCALE, (y + 1) * SCALE)
+            out.paste(big.crop(box), (left + box[0], box[1]))
+    for cx, cy in sorted({(x // cell, y // 8) for x, y in changed}):
+        for _, left in sides:
+            x0, y0 = left + cx * cell * SCALE, cy * 8 * SCALE
+            x1, y1 = x0 + cell * SCALE, y0 + 8 * SCALE
+            for k in (1, 2):                       # 2-pixel frame outside the cell
+                draw.rectangle((x0 - k, y0 - k, x1 - 1 + k, y1 - 1 + k), outline=DIFF_FRAME)
+    if zoom:
+        for img, px0 in ((before, lx), (after, rx)):
+            crop = img.crop((bx0, by0, bx1, by1)).resize(((bx1 - bx0) * z, (by1 - by0) * z),
+                                                         Image.NEAREST)
+            out.paste(crop, (px0, top))
+            if z >= 6:      # outline the edge of each changed area, not every pixel
+                cset = set(changed)
+                for x, y in changed:
+                    qx, qy = px0 + (x - bx0) * z, top + (y - by0) * z
+                    if (x - 1, y) not in cset:
+                        draw.rectangle((qx, qy, qx + 1, qy + z - 1), fill=DIFF_FRAME)
+                    if (x + 1, y) not in cset:
+                        draw.rectangle((qx + z - 2, qy, qx + z - 1, qy + z - 1), fill=DIFF_FRAME)
+                    if (x, y - 1) not in cset:
+                        draw.rectangle((qx, qy, qx + z - 1, qy + 1), fill=DIFF_FRAME)
+                    if (x, y + 1) not in cset:
+                        draw.rectangle((qx, qy + z - 2, qx + z - 1, qy + z - 1), fill=DIFF_FRAME)
     return out
+
+
+def diff_stats(before, after, cell=8):
+    """(changed screen pixels, cells touched) between two same-size pictures."""
+    w, h = after.size
+    b, f = before.load(), after.load()
+    changed = [(x, y) for y in range(h) for x in range(w) if b[x, y] != f[x, y]]
+    return len(changed), len({(x // cell, y // 8) for x, y in changed})
 
 
 # ---------- report ------------------------------------------------------------
@@ -843,8 +909,11 @@ def check(args, then_args):
         fixed = render(a, fl)
         files.append((outs["--fix"], _prepare("--fix", lambda: _png_bytes(fixed))))
         diff_path = outs["--fix (its .diff.png)"]
-        files.append((diff_path, _prepare("--fix", lambda: _png_bytes(diff_image(img, fixed)))))
+        cell_px = a.cell_w * (a.size[0] // a.lw)        # cell width in input pixels
+        files.append((diff_path, _prepare(
+            "--fix", lambda: _png_bytes(diff_image(img, fixed, cell_px)))))
         wrote.append(f"{args.fix} and {diff_path}")
+        n_px, n_cells = diff_stats(img, fixed, cell_px)
         clean_png = clean_png or Path(args.fix)
         clean_logical = clean_logical or fl
 
@@ -860,6 +929,9 @@ def check(args, then_args):
     _commit(files)
     for w in wrote:
         print(f"[*] wrote {w}")
+    if args.fix:
+        print(f"[*] the fix changed {n_px} screen pixel(s) in {n_cells} cell(s); "
+              f"{outs['--fix (its .diff.png)']} shows them framed, with a zoom underneath")
     if kla_skipped:
         print("[!] --kla not written: the picture is not clean; add --fix to "
               "write the fixed picture as Koala")

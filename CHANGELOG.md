@@ -16,3 +16,4 @@ First version.
 - `--then png2prg` works with 160-wide pictures (png2prg gets a
   pixel-doubled copy).
 - Outputs are all-or-nothing; exit code 3 when png2prg fails.
+- `.diff.png` frames every changed cell and adds a zoom of the changed area.

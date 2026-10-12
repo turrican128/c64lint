@@ -43,8 +43,12 @@ See what is wrong, and what the fix would change:
 c64lint check pic.png --mode mc --overlay problems.png --fix fixed.png
 ```
 
-`fixed.png` is your picture with the cheapest fix applied; `fixed.diff.png`
-shows before and after side by side, with only the changed pixels lit.
+`fixed.png` is your picture with the cheapest fix applied. `fixed.diff.png`
+shows before and after side by side: everything the fix left alone is grey,
+every cell it touched is framed magenta (visible even as a thumbnail), and a
+zoom underneath shows just the changed area, magnified up to 16x, with old
+colours on the left and new ones on the right. The console says how many
+pixels and cells changed.
 
 **Your picture is never written to.** Every output path is checked before
 anything is written: one that names your input - by any spelling, a
@@ -119,7 +123,7 @@ pixels).
 | `--bg N` | Background colour 0-15 (multicolour only). Skips costing the other 15, which is much faster on busy pictures |
 | `--overlay OUT.png` | Problems drawn over your picture, 5x size |
 | `--json OUT.json` | Everything in the report, machine-readable |
-| `--fix OUT.png` | Cheapest fix, plus `OUT.diff.png`: before and after side by side |
+| `--fix OUT.png` | Cheapest fix, plus `OUT.diff.png`: before/after with changed cells framed and a zoom of the changed area |
 | `--kla OUT.kla` | Koala file (multicolour). Written only from a clean result |
 | `--then png2prg -- ARGS` | Run png2prg with ARGS on the clean result (`--then=png2prg` works too). png2prg reads 320x200 only, so a 160-wide picture is handed over as a pixel-doubled temporary copy |
 
