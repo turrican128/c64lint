@@ -81,6 +81,20 @@ review, 2026-10-07: the README had wrongly promised no new colours).
 A forced --bg skips costing the other 15 backgrounds (33 s -> 1.5 s on
 noise). The cell-fix memo lives for one analysis, never process-wide.
 
+Third review (2026-10-12, QA agent + real png2prg 1.12 + Alex's manual test):
+- 160-wide pictures go to png2prg as a pixel-doubled temporary copy (it
+  reads 320x200 only).
+- A colour exact in any built-in palette keeps its number under a forced
+  --palette; colours that collapse to one number are reported in notes.
+- Background hint: when the auto background is not the most-used colour,
+  say so and give the cost of --bg <that colour>.
+- Outputs are built in memory and committed via temp files + os.replace:
+  exit 2 writes nothing and keeps older outputs. png2prg presence is checked
+  first. png2prg failing = exit 3.
+- Refused outputs also include NTFS streams and Windows device names. Input
+  is identified by its signature before Pillow opens it. allow_abbrev off;
+  --then=png2prg accepted. JSON gains `notes`.
+
 Output safety (added after QA): every output path, including the derived
 `.diff.png`, is checked before anything is written. Same file as the input
 (compared by resolved path and by `os.path.samefile`, which covers case,

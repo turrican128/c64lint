@@ -48,9 +48,14 @@ shows before and after side by side, with only the changed pixels lit.
 
 **Your picture is never written to.** Every output path is checked before
 anything is written: one that names your input - by any spelling, a
-different case, a UNC or `\\?\` path, a hardlink - is refused, as are two
-outputs on the same file or a folder that does not exist. A refused run
-writes nothing.
+different case, a UNC or `\\?\` path, a hardlink, an NTFS stream
+(`pic.png:x`) - is refused, as are two outputs on the same file, Windows
+device names (`CON`, `NUL`, `COM1` ...) and a folder that does not exist.
+
+**All outputs or none.** Every output is built in memory first and only
+written when all of them are ready, so a run that stops with exit code 2
+leaves no half-written set behind and does not touch older outputs. (Exit
+code 3, png2prg failing, comes after c64lint's own outputs were written.)
 
 Then build it:
 
@@ -65,7 +70,10 @@ c64lint check pic.png --mode mc --fix fixed.png --then png2prg -- -d -o pic.prg
    VICE ships, plus Colodore) and picks the closest. Colours that are not an
    exact palette entry are reported with their nearest C64 colour and how far
    off they are (CIE dE). Force one with `--palette`; list them with
-   `c64lint palettes`.
+   `c64lint palettes`. All the palettes number their 16 colours the same way,
+   so a colour that is exact in *any* of them keeps its number when you force
+   another one. When two different input colours end up as the same C64
+   colour, the report says so.
 2. **Pixel pairs** (multicolour at 320 wide). Multicolour pixels are two
    screen pixels wide. A pair with two different colours is a hires pixel
    that slipped in.
@@ -73,7 +81,14 @@ c64lint check pic.png --mode mc --fix fixed.png --then png2prg -- -d -o pic.prg
    whole picture with it would cost. The ranking is printed; the cheapest is
    used unless you give `--bg N`. A single broken cell can often be "fixed" by
    choosing one of its own colours as background - if the ranking surprises
-   you, that is usually why, and `--bg` puts you in charge.
+   you, that is usually why, and `--bg` puts you in charge. When the cheapest
+   background is not the colour covering most of the picture, c64lint says so
+   and tells you how many cells would need fixing with that colour instead:
+
+   ```
+   [*] background: 2 red (best)
+   [!] background 2 red was picked because it is the cheapest, but 6 blue covers 51% of the picture. If blue is meant to be the background, run again with --bg 6: then 7 cell(s) need fixing
+   ```
 4. **Cells.** Multicolour: each 4x8 cell may hold the background + 3 colours.
    Hires: each 8x8 cell may hold 2 colours.
 
@@ -84,7 +99,8 @@ smallest total *visible* change wins. Visible means the colour difference as
 the eye sees it (CIE Lab), not raw RGB, so a stray dark blue turns dark grey,
 not yellow. Each removed pixel goes to its nearest kept colour.
 
-- Cells that were already fine are never touched.
+- Cells without a colour clash are only touched to snap off-palette colours
+  and to resolve split pixel pairs; their colour choice is never changed.
 - No dithering is added.
 - Same input, same options: byte-identical output.
 - A fix only uses colours already in the cell, plus the background colour,
@@ -105,14 +121,25 @@ pixels).
 | `--json OUT.json` | Everything in the report, machine-readable |
 | `--fix OUT.png` | Cheapest fix, plus `OUT.diff.png`: before and after side by side |
 | `--kla OUT.kla` | Koala file (multicolour). Written only from a clean result |
-| `--then png2prg -- ARGS` | Run png2prg with ARGS on the clean result |
+| `--then png2prg -- ARGS` | Run png2prg with ARGS on the clean result (`--then=png2prg` works too). png2prg reads 320x200 only, so a 160-wide picture is handed over as a pixel-doubled temporary copy |
 
 "Clean result" means: your picture if it passed, otherwise the `--fix`
 picture. Without `--fix` a picture that fails gets no Koala file and no png2prg
 run - c64lint never builds from something it just told you is broken.
 
 Exit codes: `0` clean, `1` problems found (even if `--fix` fixed them), `2`
-bad input or bad options. Use it in a makefile in front of png2prg.
+bad input or bad options (nothing written), `3` png2prg failed. Use it in a
+makefile in front of png2prg. Options must be spelled out in full
+(`--mode`, not `--mo`).
+
+### The JSON report
+
+`version`, `tool`, `file`, `notes` (every `[!]` warning that is not about one
+cell or colour: background hint, merged colours, animated PNG ...), `mode`,
+`palette`, `bg` (null in hires), `bg_ranking` (all 16 backgrounds, cheapest
+first; just the one you gave when `--bg` is used), `off_palette`, `pairs`,
+`cells`, `clean`. Colour numbers are integers everywhere except the keys of
+`cells[].colours`, which JSON forces to be strings (`"6": 18`).
 
 ## Input
 

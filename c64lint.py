@@ -9,13 +9,16 @@ picture to png2prg (github.com/staD020/png2prg).
 """
 
 import argparse
+import io
 import itertools
 import json
 import math
 import os
 import shutil
+import shlex
 import subprocess
 import sys
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -55,6 +58,14 @@ PALETTES = {
     for name, row in _PALETTE_HEX.items()
 }
 
+# Every built-in palette numbers its colours the same way, and no RGB value sits
+# at two different numbers across them, so a colour that exactly matches ANY
+# palette keeps that number even when another palette is forced.
+EXACT_ANY = {}
+for _pal in PALETTES.values():
+    for _i, _rgb in enumerate(_pal):
+        EXACT_ANY.setdefault(_rgb, _i)
+
 FAR_DELTA_E = 20.0   # beyond this from every palette entry: probably not C64 art
 MAX_COLOURS = 256    # more distinct colours than this: a photo, not pixel art
 SIZES = ((160, 200), (320, 200))
@@ -62,6 +73,12 @@ SIZES = ((160, 200), (320, 200))
 
 class LintError(Exception):
     """Bad input or usage: reported with '!!' and exit code 2."""
+    code = 2
+
+
+class Png2prgError(LintError):
+    """png2prg ran but failed: exit code 3, so scripts can tell it apart."""
+    code = 3
 
 
 # ---------- colour maths ------------------------------------------------------
@@ -89,6 +106,22 @@ def delta_e(a, b):
 
 # ---------- input -------------------------------------------------------------
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _sniff(head):
+    """Name a non-PNG file from its first bytes."""
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "WEBP"
+    if head[4:8] == b"ftyp" and head[8:12] in (b"avif", b"avis"):
+        return "AVIF"
+    for magic, name in ((b"\xff\xd8", "JPEG"), (b"GIF8", "GIF"), (b"BM", "BMP"),
+                        (b"II*\x00", "TIFF"), (b"MM\x00*", "TIFF")):
+        if head.startswith(magic):
+            return name
+    return "not a PNG file" if head else "an empty file"
+
+
 def load_png(path):
     """Return (RGB image, notes), or raise LintError with a readable reason.
 
@@ -99,6 +132,10 @@ def load_png(path):
     if not path.is_file():
         raise LintError(f"{path}: file not found")
     notes = []
+    with open(path, "rb") as f:
+        head = f.read(16)
+    if head[:8] != PNG_SIGNATURE:
+        raise LintError(f"{path}: is {_sniff(head)}, c64lint reads PNG only")
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
@@ -168,6 +205,7 @@ def analyse(img, mode, palette=None, bg=None):
 
     a = Analysis()
     a.mode, a.size = mode, (w, h)
+    a.bg_note = None
     rgb = list(_pixels(img))
 
     # 1. palette
@@ -187,20 +225,34 @@ def analyse(img, mode, palette=None, bg=None):
     plab = [rgb_to_lab(p) for p in pal]
     a.de = [[delta_e(p, q) for q in plab] for p in plab]
     exact = {p: i for i, p in reversed(list(enumerate(pal)))}
-    snap, a.off_palette = {}, []
+    snap, a.off_palette, a.notes = {}, [], []
     for c in first:
         if c in exact:
             snap[c] = exact[c]
             continue
         lab = rgb_to_lab(c)
         dists = [delta_e(lab, p) for p in plab]
-        idx = min(range(16), key=lambda k: (dists[k], k))
+        if c in EXACT_ANY:          # another palette's exact colour: keep its number
+            idx = EXACT_ANY[c]
+        else:
+            idx = min(range(16), key=lambda k: (dists[k], k))
         snap[c] = idx
         a.off_palette.append({
             "rgb": "#%02X%02X%02X" % c, "count": counts[c], "first": list(first[c]),
             "nearest": idx, "delta_e": round(dists[idx], 2),
             "far": dists[idx] > FAR_DELTA_E,
         })
+    groups = {}
+    for c, idx in snap.items():
+        groups.setdefault(idx, []).append(c)
+    for idx in sorted(groups):
+        cs = sorted(groups[idx], key=lambda c: -counts[c])
+        if len(cs) > 1:
+            shown = ", ".join("#%02X%02X%02X" % c for c in cs[:3])
+            more = f" and {len(cs) - 3} more" if len(cs) > 3 else ""
+            a.notes.append(f"{len(cs)} different colours ({shown}{more}) both read as "
+                           f"{idx} {COLOUR_NAMES[idx]}; if they were meant to be different "
+                           "C64 colours, check the palette (--palette)")
     a.off_palette.sort(key=lambda o: (o["first"][1], o["first"][0]))
     grid = [snap[c] for c in rgb]          # palette index per input pixel
 
@@ -278,6 +330,16 @@ def analyse(img, mode, palette=None, bg=None):
             del r["_key"]
         a.bg_ranking = ranking
         a.bg = ranking[0]["bg"] if bg is None else bg
+        main_colour = max(range(16), key=lambda c: (totals[c], -c))
+        if bg is None and a.bg != main_colour:
+            alt = next(r for r in ranking if r["bg"] == main_colour)
+            share = round(100 * totals[main_colour] / len(logical))
+            a.bg_note = (
+                f"background {a.bg} {COLOUR_NAMES[a.bg]} was picked because it is the "
+                f"cheapest, but {main_colour} {COLOUR_NAMES[main_colour]} covers {share}% "
+                f"of the picture. If {COLOUR_NAMES[main_colour]} is meant to be the "
+                f"background, run again with --bg {main_colour}: then "
+                f"{alt['bad_cells']} cell(s) need fixing")
     else:
         a.bg_ranking = []
         a.bg = None
@@ -547,6 +609,8 @@ def print_report(a, path, palette_forced, bg_forced, notes=()):
             print(f"[*] background ranking: {top}")
         src = "forced with --bg; ranking skipped" if bg_forced else "best"
         print(f"[*] background: {_name(a.bg)} ({src})")
+        if a.bg_note:
+            print(f"[!] {a.bg_note}")
     for c in a.cells:
         cols = ", ".join(f"{_name(int(k))} x{n}" for k, n in c["colours"].items())
         sur = ", ".join(_name(s) for s in c["surplus"])
@@ -565,9 +629,10 @@ def print_report(a, path, palette_forced, bg_forced, notes=()):
         print(f"[!] NOT CLEAN: {', '.join(bits)}")
 
 
-def report_json(a, path):
+def report_json(a, path, notes=()):
     return {
         "version": 1, "tool": f"c64lint {VERSION}", "file": str(path),
+        "notes": list(notes) + ([a.bg_note] if a.bg_note else []),
         "mode": a.mode, "palette": a.palette, "bg": a.bg,
         "bg_ranking": a.bg_ranking, "off_palette": a.off_palette,
         "pairs": a.pairs, "cells": a.cells, "clean": a.clean,
@@ -578,11 +643,11 @@ def report_json(a, path):
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        prog="c64lint",
+        prog="c64lint", allow_abbrev=False,
         description="Check a PNG against C64 bitmap mode rules and explain the clashes.")
     ap.add_argument("--version", action="version", version=f"c64lint {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("check", help="check a picture")
+    c = sub.add_parser("check", help="check a picture", allow_abbrev=False)
     c.add_argument("png")
     c.add_argument("--mode", required=True, choices=["mc", "hires"])
     c.add_argument("--palette", choices=list(PALETTES), help="skip detection")
@@ -606,7 +671,8 @@ def main(argv=None):
             pass
     argv = list(sys.argv[1:] if argv is None else argv)
     then_args = []
-    if "--then" in argv and "--" in argv:
+    wants_then = any(x == "--then" or x.startswith("--then=") for x in argv)
+    if wants_then and "--" in argv:
         i = argv.index("--")
         argv, then_args = argv[:i], argv[i + 1:]
     try:
@@ -621,7 +687,7 @@ def main(argv=None):
         return check(args, then_args)
     except LintError as e:
         print(f"!! {e}")
-        return 2
+        return e.code
 
 
 def _same_file(p, q):
@@ -638,6 +704,10 @@ def _same_file(p, q):
         return False
 
 
+DEVICE_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                *(f"LPT{i}" for i in range(1, 10))}
+
+
 def plan_outputs(args, src_path):
     """Every file this run will write, checked before anything is written.
 
@@ -652,6 +722,12 @@ def plan_outputs(args, src_path):
     if args.fix:
         outs.append(("--fix (its .diff.png)", Path(args.fix).with_suffix(".diff.png")))
     for flag, path in outs:
+        if ":" in path.name:
+            raise LintError(f"{flag} {path}: a ':' in the file name writes an NTFS "
+                            "alternate data stream; choose a plain file name")
+        if path.name.split(".")[0].upper() in DEVICE_NAMES:
+            raise LintError(f"{flag} {path}: {path.name.split('.')[0]} is a Windows "
+                            "device name, not a file; choose another name")
         if flag in ("--fix", "--overlay") and path.suffix.lower() != ".png":
             raise LintError(f"{flag} {path}: must be a .png file")
         if path.is_dir():
@@ -667,11 +743,65 @@ def plan_outputs(args, src_path):
     return dict(outs)
 
 
-def _write(path, writer):
+def _png_bytes(img):
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _commit(files):
+    """Write every (path, bytes) or none of them.
+
+    Each file goes to a temporary name next to its target first; only when
+    all of them are on disk are they renamed into place. A failure removes
+    the temporaries and leaves any older outputs exactly as they were."""
+    temps = []
     try:
-        writer(path)
-    except (OSError, ValueError) as e:
+        for path, data in files:
+            tmp = path.with_name(path.name + ".c64lint-tmp")
+            tmp.write_bytes(data)
+            temps.append((tmp, path))
+        for tmp, path in temps:
+            os.replace(tmp, path)
+    except OSError as e:
+        for tmp, _ in temps:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
         raise LintError(f"could not write {path}: {e}") from None
+
+
+def _prepare(label, make):
+    try:
+        return make()
+    except (OSError, ValueError) as e:
+        raise LintError(f"could not prepare {label}: {e}") from None
+
+
+def _shell_line(cmd):
+    return subprocess.list2cmdline(cmd) if os.name == "nt" else shlex.join(cmd)
+
+
+def _run_png2prg(exe, then_args, png_path, width):
+    """png2prg only reads 320x200: a 160-wide multicolour picture is handed
+    over as a pixel-doubled temporary copy, which is removed afterwards."""
+    with tempfile.TemporaryDirectory(prefix="c64lint-") as tmpdir:
+        target = png_path
+        if width == 160:
+            target = Path(tmpdir) / (Path(png_path).stem + "-320.png")
+            with Image.open(png_path) as img:
+                img.convert("RGB").resize((320, 200), Image.NEAREST).save(target)
+            print("[*] png2prg reads 320x200 only: passing it a pixel-doubled copy")
+        cmd = [exe, *then_args, str(target)]
+        print(f"[*] running {_shell_line(cmd)}")
+        try:
+            result = subprocess.run(cmd)
+        except OSError as e:
+            raise LintError(f"could not start png2prg ({exe}): {e}") from None
+    if result.returncode != 0:
+        raise Png2prgError(f"png2prg failed with exit code {result.returncode} "
+                           "(see its output above)")
 
 
 def check(args, then_args):
@@ -680,6 +810,11 @@ def check(args, then_args):
     if args.kla and args.mode != "mc":
         raise LintError("--kla writes Koala, which is multicolour; hires output: "
                         "use --then png2prg")
+    exe = None
+    if args.then:                       # before anything is read or written
+        exe = shutil.which("png2prg")
+        if exe is None:
+            raise LintError(f"png2prg not found on PATH - get it from {PNG2PRG_URL}")
     src_path = Path(args.png)
     outs = plan_outputs(args, src_path)
     img, notes = load_png(src_path)
@@ -687,53 +822,54 @@ def check(args, then_args):
         notes.append("--bg ignored: hires has no shared background colour")
         args.bg = None
     a = analyse(img, args.mode, args.palette, args.bg)
+    notes = notes + a.notes
     print_report(a, src_path, args.palette is not None, args.bg is not None, notes)
 
+    # build every output in memory first; nothing touches the disk until all
+    # of them exist, so an error leaves no half-written set behind
+    files, wrote = [], []
     if args.json:
-        text = json.dumps(report_json(a, src_path), indent=1) + "\n"
-        _write(outs["--json"], lambda p: p.write_text(text, encoding="utf-8"))
-        print(f"[*] wrote {args.json}")
+        text = json.dumps(report_json(a, src_path, notes), indent=1) + "\n"
+        files.append((outs["--json"], text.encode("utf-8")))
+        wrote.append(args.json)
     if args.overlay:
-        _write(outs["--overlay"], overlay(a, img).save)
-        print(f"[*] wrote {args.overlay}")
+        files.append((outs["--overlay"], _prepare("--overlay", lambda: _png_bytes(overlay(a, img)))))
+        wrote.append(args.overlay)
 
     clean_png = src_path if a.clean else None
     clean_logical = a.logical if a.clean else None
     if args.fix:
         fl = fixed_logical(a)
         fixed = render(a, fl)
-        _write(outs["--fix"], fixed.save)
+        files.append((outs["--fix"], _prepare("--fix", lambda: _png_bytes(fixed))))
         diff_path = outs["--fix (its .diff.png)"]
-        _write(diff_path, diff_image(img, fixed).save)
-        print(f"[*] wrote {args.fix} and {diff_path}")
+        files.append((diff_path, _prepare("--fix", lambda: _png_bytes(diff_image(img, fixed)))))
+        wrote.append(f"{args.fix} and {diff_path}")
         clean_png = clean_png or Path(args.fix)
         clean_logical = clean_logical or fl
 
+    kla_skipped = False
     if args.kla:
         if clean_logical is None:
-            print("[!] --kla not written: the picture is not clean; add --fix to "
-                  "write the fixed picture as Koala")
+            kla_skipped = True
         else:
-            data = encode_koala(a, clean_logical, a.bg)
-            _write(outs["--kla"], lambda p: p.write_bytes(data))
-            print(f"[*] wrote {args.kla}")
+            data = _prepare("--kla", lambda: encode_koala(a, clean_logical, a.bg))
+            files.append((outs["--kla"], data))
+            wrote.append(args.kla)
+
+    _commit(files)
+    for w in wrote:
+        print(f"[*] wrote {w}")
+    if kla_skipped:
+        print("[!] --kla not written: the picture is not clean; add --fix to "
+              "write the fixed picture as Koala")
 
     if args.then:
-        exe = shutil.which("png2prg")
-        if exe is None:
-            raise LintError(f"png2prg not found on PATH - get it from {PNG2PRG_URL}")
         if clean_png is None:
             print("[!] png2prg not run: the picture is not clean; add --fix to run it "
                   "on the fixed picture")
         else:
-            cmd = [exe, *then_args, str(clean_png)]
-            print(f"[*] running {' '.join(cmd)}")
-            try:
-                result = subprocess.run(cmd)
-            except OSError as e:
-                raise LintError(f"could not start png2prg ({exe}): {e}") from None
-            if result.returncode != 0:
-                raise LintError("png2prg failed (see its output above)")
+            _run_png2prg(exe, then_args, clean_png, a.size[0])
     return 0 if a.clean else 1
 
 
