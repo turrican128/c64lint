@@ -16,16 +16,12 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - os: ubuntu-22.04   # oldest supported runner: oldest glibc, widest Linux reach
+          - os: ubuntu-22.04   # the Linux binary itself is built in Debian 11, see below
             target: linux
             binary: c64lint
-            strip: "--strip"
           - os: windows-2022
             target: windows
             binary: c64lint.exe
-            # --strip corrupts the bundled python DLL on Windows (txt2dirart
-            # v0.9.0-rc2: builds, then exits 127 "Failed to load Python DLL").
-            strip: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -39,32 +35,26 @@ jobs:
       - name: tests must pass before anything is built
         run: python -m pytest tests/ -q
 
-      - name: build single-file binary
-        # Measured on Windows (2026-10-07): a plain build is 27 MB, because
-        # PyInstaller drags in numpy (Pillow can use it, c64lint never does),
-        # Pillow's AVIF/WebP/colour-management codecs and OpenSSL. Excluding
-        # them gives 8.2 MB with byte-identical output on every example.
-        #
-        # Keep PIL.ImageFont: ImageDraw imports it at module level, and a
-        # build without it compiles cleanly and dies on startup. Only its
-        # FreeType engine (PIL._imagingft) is safe to drop. The smoke test
-        # below is what catches the next module like that.
-        run: >
-          pyinstaller --onefile --name c64lint
-          --console --noupx ${{ matrix.strip }}
-          --exclude-module tkinter --exclude-module unittest
-          --exclude-module pydoc --exclude-module doctest
-          --exclude-module pdb --exclude-module sqlite3
-          --exclude-module asyncio --exclude-module numpy
-          --exclude-module PIL.ImageQt --exclude-module PIL.ImageTk
-          --exclude-module PIL.ImageShow
-          --exclude-module PIL._avif --exclude-module PIL.AvifImagePlugin
-          --exclude-module PIL._webp --exclude-module PIL.WebPImagePlugin
-          --exclude-module PIL._imagingcms --exclude-module PIL.ImageCms
-          --exclude-module PIL._imagingft
-          --exclude-module ssl --exclude-module _ssl
-          --exclude-module hashlib --exclude-module _hashlib
-          c64lint.py
+      - name: build single-file binary (Windows)
+        if: matrix.target == 'windows'
+        run: python tools/build_binary.py
+
+      - name: build single-file binary (Linux, inside Debian 11)
+        if: matrix.target == 'linux'
+        # A PyInstaller binary needs at least the glibc it was built against.
+        # Built on the runner (ubuntu-22.04, glibc 2.35) it would not start on
+        # Debian 11 or Ubuntu 20.04 - 1.0.0-rc2's distro check caught exactly
+        # that. Building inside python:3.11 on Debian bullseye (glibc 2.31)
+        # gives a binary that runs on anything from 2020/2021 onward.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src python:3.11-slim-bullseye bash -euc '
+            apt-get update -qq
+            apt-get install -y -qq binutils > /dev/null
+            python -m pip install --quiet pyinstaller pillow
+            python tools/build_binary.py --strip
+            chown -R '"$(id -u):$(id -g)"' dist build
+          '
+          objdump -T dist/c64lint | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1
 
       - name: the binary must actually run
         shell: bash
