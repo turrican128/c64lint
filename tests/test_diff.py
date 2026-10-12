@@ -26,19 +26,19 @@ def test_changed_cell_is_framed(tmp_path, run):
     gap = 4 * S
     for left in (0, 320 * S + gap):                     # both halves
         # frame sits just outside the cell's left edge
-        assert px[left + 24 * S - 1, 20 * S] == MAGENTA
-        assert px[left + 24 * S - 2, 20 * S] == MAGENTA
+        assert px[left + 24 * S - 1, c64lint.DIFF_TOP + 20 * S] == MAGENTA
+        assert px[left + 24 * S - 2, c64lint.DIFF_TOP + 20 * S] == MAGENTA
 
 
 def test_unchanged_area_is_grey(tmp_path, run):
     _, _, diff, _ = fixed_pair(tmp_path, run)
-    r, g, b = diff.getpixel((200 * S + 2, 150 * S + 2))  # far from the change
+    r, g, b = diff.getpixel((200 * S + 2, c64lint.DIFF_TOP + 150 * S + 2))  # far from the change
     assert r == g == b
 
 
 def test_zoom_panel_shows_old_and_new_colour(tmp_path, run):
     before, after, diff, _ = fixed_pair(tmp_path, run)
-    assert diff.height > 200 * S                          # zoom panel below
+    assert diff.height > c64lint.DIFF_TOP + 200 * S                          # zoom panel below
     changed = [(x, y) for y in range(200) for x in range(320)
                if before.getpixel((x, y)) != after.getpixel((x, y))]
     x, y = changed[0]
@@ -59,4 +59,4 @@ def test_no_zoom_panel_when_nothing_changed(tmp_path, run):
     p = make_png(tmp_path / "in.png", 320, 200, 6, mc_cell(3, 2, [1, 2, 3]))
     run("check", p, "--mode", "mc", "--fix", tmp_path / "f.png")
     diff = Image.open(tmp_path / "f.diff.png")
-    assert diff.height == 200 * S
+    assert diff.height == c64lint.DIFF_TOP + 200 * S

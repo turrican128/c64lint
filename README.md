@@ -23,6 +23,33 @@ It is a checker, not a converter. When the picture is clean it hands it to
 *Overlay of `examples/02-bird-clash.png`: the broken cell framed red, the
 surplus pixel marked magenta, everything that is fine dimmed.*
 
+## First run
+
+Download `c64lint-1.0.0.zip` from the
+[releases page](https://github.com/turrican128/c64lint/releases) and unpack it.
+It holds `c64lint.exe` (Windows), `c64lint` (Linux, x86-64), `c64lint.py` (the
+same tool as Python source), this README and `examples/`. Nothing to install.
+
+**Windows:** open a terminal in the unpacked folder (in Explorer: type `cmd`
+in the address bar and press Enter) and run
+
+```
+c64lint.exe check examples\02-bird-clash.png --mode mc --overlay ov.png --fix fixed.png
+```
+
+In PowerShell type `.\c64lint.exe` instead of `c64lint.exe`.
+
+**Linux:**
+
+```
+chmod +x c64lint
+./c64lint check examples/02-bird-clash.png --mode mc --overlay ov.png --fix fixed.png
+```
+
+Then open `ov.png` (what is wrong) and `fixed.diff.png` (what the fix
+changed). The examples below write `c64lint`; use whichever of the above fits
+your system.
+
 ## Quick start
 
 ```
@@ -44,11 +71,11 @@ c64lint check pic.png --mode mc --overlay problems.png --fix fixed.png
 ```
 
 `fixed.png` is your picture with the cheapest fix applied. `fixed.diff.png`
-shows before and after side by side: everything the fix left alone is grey,
-every cell it touched is framed magenta (visible even as a thumbnail), and a
-zoom underneath shows just the changed area, magnified up to 16x, with old
-colours on the left and new ones on the right. The console says how many
-pixels and cells changed.
+shows BEFORE (left) and AFTER (right), labelled: everything the fix left alone
+is grey, every cell it touched is framed magenta (visible even as a
+thumbnail), and a zoom underneath shows just the changed area, magnified up
+to 16x, with every changed pixel outlined or ringed in magenta. The console
+says how many pixels and cells changed.
 
 **Your picture is never written to.** Every output path is checked before
 anything is written: one that names your input - by any spelling, a
@@ -96,6 +123,21 @@ c64lint check pic.png --mode mc --fix fixed.png --then png2prg -- -d -o pic.prg
 4. **Cells.** Multicolour: each 4x8 cell may hold the background + 3 colours.
    Hires: each 8x8 cell may hold 2 colours.
 
+**What "cost" means.** Every pixel the fix would repaint adds how far its
+colour moves, as the eye sees it (CIE dE: about 2 is barely visible, 20 is a
+different colour). A cell's cost is that sum for its cheapest fix; a
+background's cost is the sum over the whole picture. 0 means the picture is
+legal with that background as drawn. Ties are common: on a clean picture
+every background that fits costs 0, and then the colour covering most of the
+picture wins.
+
+**Colour numbers** are the C64's own:
+
+| | | | | | | | |
+|---|---|---|---|---|---|---|---|
+| 0 black | 1 white | 2 red | 3 cyan | 4 purple | 5 green | 6 blue | 7 yellow |
+| 8 orange | 9 brown | 10 light red | 11 dark grey | 12 grey | 13 light green | 14 light blue | 15 light grey |
+
 ## How the fix decides
 
 For a broken cell, every allowed set of colours is tried and the one with the
@@ -130,6 +172,11 @@ pixels).
 "Clean result" means: your picture if it passed, otherwise the `--fix`
 picture. Without `--fix` a picture that fails gets no Koala file and no png2prg
 run - c64lint never builds from something it just told you is broken.
+
+**png2prg** is not included: get it from
+[github.com/staD020/png2prg](https://github.com/staD020/png2prg) (one file per
+system) and put it in a folder on your PATH. If c64lint cannot find it, it
+says so before writing anything (exit code 2).
 
 Exit codes: `0` clean, `1` problems found (even if `--fix` fixed them), `2`
 bad input or bad options (nothing written), `3` png2prg failed. Use it in a
@@ -169,8 +216,8 @@ FLI/AFLI, sprites, charsets, reading .kla/.art files, writing hires files
 
 ## Install
 
-Download the zip from the releases page: one file for Windows, one for Linux,
-nothing to install. Or run the source with Python 3.10+ and Pillow:
+See **First run** at the top: the release zip needs no installation. To run
+the source instead, use Python 3.10+ with Pillow:
 
 ```
 pip install pillow

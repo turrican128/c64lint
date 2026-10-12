@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.1.0
+## 1.0.0 (2026-10-13)
 
-First version.
+First release. (0.1.0-rc1 was a release candidate on GitHub only.)
 
 - Checks PNG pictures against C64 multicolour and hires bitmap rules.
 - Detects the palette (15 built in) and reports near-miss colours.
@@ -17,3 +17,9 @@ First version.
   pixel-doubled copy).
 - Outputs are all-or-nothing; exit code 3 when png2prg fails.
 - `.diff.png` frames every changed cell and adds a zoom of the changed area.
+- Labelled `.diff.png` (BEFORE / AFTER, zoom captions); every changed pixel
+  outlined or ringed.
+- Hints when the mode looks wrong (`--mode hires` vs `--mode mc`).
+- Help text for every option; exit codes in `-h`; no arguments prints help.
+- Long lists of broken cells are capped on screen (`--json` has them all).
+

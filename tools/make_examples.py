@@ -80,13 +80,27 @@ def main():
     img.save(EX / "04-off-palette.png")
     made.append("04-off-palette.png      near-miss RGB values from the editor")
 
-    # hires: a third colour inside 8x8 cells
+    # hires: stray specks on the edges of white block letters. The letters
+    # sit 3 px off the 8x8 grid, so edge cells already hold black AND white;
+    # a speck there is a third colour, and the obvious fix is to paint it
+    # back to whatever surrounds it.
     img = Image.new("RGB", (320, 200), PAL[0])
     d = ImageDraw.Draw(img)
-    d.rectangle((40, 40, 279, 159), outline=PAL[1])
-    d.line((40, 100, 279, 100), fill=PAL[14])
+    o = 3
+    for x0 in (64, 136, 208):
+        d.rectangle((x0 + o, 64 + o, x0 + 47 + o, 135 + o), fill=PAL[1])
+    for x0, y0, x1, y1 in ((80, 80, 111, 119), (96, 88, 111, 111),            # C
+                           (152, 80, 167, 95), (152, 104, 167, 119), (168, 80, 183, 95),  # 6
+                           (224, 64, 239, 95), (224, 112, 239, 135), (240, 80, 255, 95)):  # 4
+        d.rectangle((x0 + o, y0 + o, x1 + o, y1 + o), fill=PAL[0])
+    # yellow specks inside the white letters, blue specks just outside them;
+    # each lands in a cell that already holds black and white
+    for x, y in ((69, 100), (141, 110), (213, 75)):
+        img.putpixel((x, y), PAL[7])
+    for x, y in ((65, 120), (209, 130)):
+        img.putpixel((x, y), PAL[6])
     img.save(EX / "05-hires-clash.png")
-    made.append("05-hires-clash.png      hires: light blue line crosses white frame")
+    made.append("05-hires-clash.png      hires: stray yellow and blue pixels on the letter edges")
 
     # the overlay for the README
     src = Image.open(EX / "02-bird-clash.png").convert("RGB")
