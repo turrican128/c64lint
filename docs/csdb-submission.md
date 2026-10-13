@@ -40,12 +40,20 @@ Upload both, in this order:
    broken in one typical way, so people can see what the tool reports before
    they point it at their own art.
 
-### Screenshot
+### Screenshots
 
-`docs/csdb-screenshot.png` (384x272). The neon-sign test picture before
-(broken cells framed red) and after `--fix` (changed cells framed magenta),
-with the matching report lines, all text in the real C64 character set. It is
-a composed picture, not a capture of a running C64 — c64lint runs on the PC.
+Upload both, in this order - the first one becomes the thumbnail:
+
+1. `docs/csdb-screenshot.png` (384x272). The neon-sign test picture before
+   (broken cells framed red) and after `--fix` (changed cells framed magenta),
+   with the matching report lines, all text in the real C64 character set. It
+   is a composed picture, not a capture of a running C64 - c64lint runs on the
+   PC.
+2. `docs/csdb-terminal.png` (744x442). A console window with the real output
+   of `c64lint.exe check examples-bird-clash.png --mode mc --overlay ov.png
+   --fix fixed.png` run in `C:\Temp\c64lint-1.0.0`, followed by a re-check of
+   `fixed.png` that comes out CLEAN. Text is the 1.0.0 binary's actual output,
+   wrapped at 90 columns.
 
 ---
 
@@ -81,6 +89,7 @@ is one file.
       `c64lint.exe check examples\02-bird-clash.png --mode mc` from the
       unpacked folder
 - [ ] You ran it on one picture of your own
-- [ ] The screenshot is `docs/csdb-screenshot.png`, 384x272
+- [ ] Screenshots: `docs/csdb-screenshot.png` (384x272) first, then
+      `docs/csdb-terminal.png` (744x442)
 - [ ] Optional: a note to Burglar first - c64lint hands its clean pictures to
       png2prg (`--then png2prg`), it is meant to sit next to his tool
